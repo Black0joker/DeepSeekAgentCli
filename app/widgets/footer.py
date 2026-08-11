@@ -5,5 +5,6 @@ class CustomFooter(Static):
     def render(self) -> str:
         state = self.app.state if hasattr(self.app, 'state') else None
         if state:
-            return f"Workspace: {state.workspace} | Branch: {state.branch} | Model: {state.model} | Mode: {state.mode} "
-        return "Workspace: . | Branch: main | Model: DeepSeek-V3 | Mode: permission "
+            thinking_label = "thinking" if state.thinking_mode else "normal"
+            return f"Workspace: {state.workspace} | Mode: {state.mode} | Thinking: {thinking_label} [Ctrl+T] "
+        return "Workspace: . | Mode: permission | Thinking: thinking [Ctrl+T] "

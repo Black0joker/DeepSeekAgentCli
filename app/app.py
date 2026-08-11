@@ -22,6 +22,10 @@ from app.theme import (
 )
 
 class MainApp(App):
+    BINDINGS = [
+        ("ctrl+t", "toggle_thinking", "Toggle thinking mode"),
+    ]
+
     CSS = f"""
     App {{
         background: {BG_MAIN};
@@ -115,6 +119,13 @@ class MainApp(App):
                 yield self.permission_selector
                 yield InputBox(id="input_box")
             yield CustomFooter(id="footer")
+
+    def action_toggle_thinking(self) -> None:
+        """Toggle thinking mode and update the footer."""
+        new_mode = self.state.toggle_thinking_mode()
+        conversation = self.query_one("#conversation")
+        conversation.write(f"Thinking mode toggled to: {new_mode}")
+        self.query_one("#footer").refresh()
 
     def on_mount(self) -> None:
         # Set workspace to actual current path

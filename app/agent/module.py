@@ -696,54 +696,27 @@ class DeepSeekClient:
         return response
 
 
-def replace_code(file_path, old_code, new_code):
-    path = Path(file_path)
-
-    text = path.read_text(encoding="utf-8")
-
-    if old_code not in text:
-        return False
-
-    text = text.replace(old_code, new_code)
-
-    path.write_text(text, encoding="utf-8")
-    return True
-
 def full_parse_sse(response) -> Generator[Dict[str, Any], None, None]:
     """
-    Supports both protocols.
+    Parse SSE stream from DeepSeek API response.
+    Accumulates the full RESPONSE content, then parses it as JSON.
 
-    Automatically detects the protocol:
+    Supports both protocols:
+    - normal: conversation_mode exists in initial response
+    - thinking: no conversation_mode
 
-        conversation_mode exists  -> normal protocol
-        otherwise                 -> thinking protocol
+    Yields:
+    - {"type": "message_id", "value": int}
+    - {"type": "status", "value": str}
+    - {"type": "action", "value": dict}
     """
-
-    STATUS_RE = re.compile(r'"status"\s*:\s*"([^"]+)"')
-
     message_sent = False
-    status_sent = False
-
     protocol = None          # "normal" | "thinking"
-
     collecting = False
     content = ""
 
-    # action parser state
-    actions_started = False
-    action_start = None
-    brace_depth = 0
-    in_string = False
-    escaped = False
-    scan_index = 0
-
     for line in response.iter_lines(decode_unicode=True):
-
-        # line = str(line).removeprefix("data: ")
-
-        Logger.warn(f"Received line: {line}")
-
-        if not line.startswith("data: "):
+        if not line or not line.startswith("data: "):
             continue
 
         try:
@@ -752,206 +725,150 @@ def full_parse_sse(response) -> Generator[Dict[str, Any], None, None]:
             continue
 
         # ------------------------------------------------------
-        # Initial response
+        # Initial response: detect protocol and get message_id
         # ------------------------------------------------------
-
         if (
             not message_sent
             and isinstance(obj.get("v"), dict)
             and "response" in obj["v"]
         ):
-
             response_obj = obj["v"]["response"]
-
             protocol = (
                 "normal"
                 if "conversation_mode" in response_obj
                 else "thinking"
             )
-
             message_id = response_obj.get("message_id")
-
             if message_id is not None:
                 message_sent = True
                 yield {
                     "type": "message_id",
                     "value": message_id,
                 }
-
             # Normal protocol may already contain a RESPONSE fragment.
             if protocol == "normal":
-
                 fragments = response_obj.get("fragments", [])
-
                 if fragments:
-
                     last = fragments[-1]
-
                     if last.get("type") == "RESPONSE":
                         collecting = True
                         content = last.get("content", "")
-
             continue
 
         # ------------------------------------------------------
-        # NORMAL PROTOCOL
+        # Check for stream end
         # ------------------------------------------------------
+        if (
+            obj.get("p") == "response/status"
+            and obj.get("o") == "SET"
+            and obj.get("v") == "FINISHED"
+        ):
+            break
 
+        # ------------------------------------------------------
+        # NORMAL PROTOCOL: accumulate RESPONSE content
+        # ------------------------------------------------------
         if protocol == "normal":
-
             if (
                 obj.get("p") == "response/fragments"
                 and obj.get("o") == "APPEND"
             ):
-
                 fragments = obj.get("v", [])
-
-                if fragments:
-
-                    fragment = fragments[0]
-
-                    if fragment.get("type") == "RESPONSE":
-
-                        collecting = True
-                        content = fragment.get("content", "")
-
-                        actions_started = False
-                        action_start = None
-                        brace_depth = 0
-                        in_string = False
-                        escaped = False
-                        scan_index = 0
-
-                        continue
-
+                if fragments and fragments[0].get("type") == "RESPONSE":
+                    collecting = True
+                    content = fragments[0].get("content", "")
             elif collecting:
-
                 path = obj.get("p")
-
-                if (
-                    path == "response/fragments/-1/content"
-                    or (
-                        path is None
-                        and isinstance(obj.get("v"), str)
-                    )
-                ):
+                if path == "response/fragments/-1/content":
+                    content += obj.get("v", "")
+                elif path is None and isinstance(obj.get("v"), str):
                     content += obj["v"]
-                else:
-                    continue
-
-            else:
-                continue
+                # Other paths (elapsed_secs, BATCH, etc.) are ignored
 
         # ------------------------------------------------------
-        # THINKING PROTOCOL
+        # THINKING PROTOCOL: accumulate content
         # ------------------------------------------------------
-
         else:
-
             path = obj.get("p")
-
             if path == "response/thinking_content":
                 collecting = False
                 continue
-
             if path == "response/content":
                 collecting = True
-
             elif path is not None:
                 collecting = False
-
             if not collecting:
                 continue
-
             value = obj.get("v")
-
             if not isinstance(value, str):
                 continue
-
             content += value
 
-        # ------------------------------------------------------
-        # STATUS
-        # ------------------------------------------------------
+    # ----------------------------------------------------------
+    # Parse the accumulated content
+    # ----------------------------------------------------------
+    if not content:
+        return
 
-        if not status_sent:
+    # Strip markdown code fences (```json ... ```)
+    text = content.strip()
+    if text.startswith("```"):
+        newline_idx = text.find("\n")
+        if newline_idx != -1:
+            text = text[newline_idx + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3].rstrip()
 
-            match = STATUS_RE.search(content)
+    # Parse JSON
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: extract the first complete JSON object
+        start = text.find("{")
+        if start == -1:
+            return
+        depth = 0
+        in_str = False
+        esc = False
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\" and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            return
+        try:
+            data = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return
 
-            if match:
+    # Yield status
+    status = data.get("status")
+    if status:
+        yield {"type": "status", "value": status}
 
-                status_sent = True
-
-                yield {
-                    "type": "status",
-                    "value": match.group(1),
-                }
-
-        # ------------------------------------------------------
-        # Find actions array
-        # ------------------------------------------------------
-
-        if not actions_started:
-
-            idx = content.find('"actions"')
-
-            if idx != -1:
-
-                bracket = content.find("[", idx)
-
-                if bracket != -1:
-
-                    actions_started = True
-                    scan_index = bracket + 1
-
-        if not actions_started:
-            continue
-
-        # ------------------------------------------------------
-        # Stream actions one-by-one
-        # ------------------------------------------------------
-
-        while scan_index < len(content):
-
-            ch = content[scan_index]
-
-            if escaped:
-                escaped = False
-
-            elif ch == "\\":
-                escaped = True
-
-            elif ch == '"':
-                in_string = not in_string
-
-            elif not in_string:
-
-                if ch == "{":
-
-                    if brace_depth == 0:
-                        action_start = scan_index
-
-                    brace_depth += 1
-
-                elif ch == "}":
-
-                    brace_depth -= 1
-
-                    if brace_depth == 0 and action_start is not None:
-
-                        action_json = content[action_start:scan_index + 1]
-
-                        try:
-                            yield {
-                                "type": "action",
-                                "value": json.loads(action_json),
-                            }
-                        except json.JSONDecodeError:
-                            pass
-
-                        action_start = None
-
-            scan_index += 1
+    # Yield all actions from the array
+    actions_list = data.get("actions", [])
+    if isinstance(actions_list, list):
+        for action in actions_list:
+            if isinstance(action, dict):
+                yield {"type": "action", "value": action}
 
 
 def load_system_prompt(path: str = "sys.md") -> str:

@@ -9,7 +9,8 @@ from typing import Callable, Dict, Any, Optional
 AgentSystemMd = os.path.join(os.path.dirname(__file__), "agent", "system.md")
 
 # Import agent modules
-from app.agent.module import DeepSeekClient, full_parse_sse, execute_tool, create_client, load_system_prompt
+from app.agent.module import DeepSeekClient, execute_tool, create_client, load_system_prompt, set_working_directory
+from app.agent.sse_parser import parse_sse
 from app.agent.logger import Logger
 from app.agent.config import Config
 
@@ -97,8 +98,9 @@ class AgentWrapper:
             # Send system prompt on first run
             if not self.system_prompt_sent.is_set():
                 self._call_callback('on_status', 'Sending System Prompt')
-                response = self.client.send_prompt(self.system_prompt, self.session_id)
-                actions = full_parse_sse(response)
+                thinking = self.app.state.thinking_mode if hasattr(self.app, 'state') else True
+                response = self.client.send_prompt(self.system_prompt, self.session_id, thinking_mode=thinking)
+                actions = parse_sse(response.iter_lines(decode_unicode=True))
                 for action in actions:
                     if action['type'] == 'message_id':
                         self.parent_message_id = action['value']
@@ -126,10 +128,12 @@ class AgentWrapper:
         while True:
             try:
                 # Send prompt to DeepSeek API
+                thinking = self.app.state.thinking_mode if hasattr(self.app, 'state') else True
                 response = self.client.send_prompt(
                     prompt,
                     self.session_id,
                     parent_message_id=self.parent_message_id,
+                    thinking_mode=thinking,
                 )
 
                 if first==False:
@@ -142,7 +146,7 @@ class AgentWrapper:
                 return
             
             Status = None
-            actions = full_parse_sse(response)
+            actions = parse_sse(response.iter_lines(decode_unicode=True))
             results = []
             
             for action in actions:
@@ -169,6 +173,13 @@ class AgentWrapper:
                         self._call_callback('on_message', user_response)
                         continue
                     
+                    elif Status == 'waiting' or Status == 'running':
+                        if action['value']['tool'] == 'ask_user':
+                            question = action['value']['arguments'].get('question', '')
+                            
+                            self._call_callback('on_status', 'finished')
+                            self._call_callback('on_finish', question)
+                            return
                     elif Status == 'running':
                         tool = action['value']['tool']
                         args = action['value']['arguments']
@@ -195,20 +206,15 @@ class AgentWrapper:
                         
                         # Execute the tool with current workspace
                         workspace = self.app.state.workspace if hasattr(self.app, 'state') else None
-                        result = execute_tool(tool, args, workspace=workspace)
+                        if workspace:
+                            set_working_directory(workspace)
+                        result = execute_tool(tool, args)
                         results.append(result)
                         
                         # Prepare the next prompt with tool output
                         prompt = f"Tool output:\n{json.dumps(results)}"
                         continue
                     
-                    elif Status == 'waiting':
-                        if action['value']['tool'] == 'ask_user':
-                            question = action['value']['arguments'].get('question', '')
-                            
-                            self._call_callback('on_status', 'finished')
-                            self._call_callback('on_finish', question)
-                            return
 
                             
                         continue

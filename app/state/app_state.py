@@ -10,6 +10,7 @@ class AppState:
     branch: str = "main"
     settings: dict = field(default_factory=dict)
     mode: str = "auto"  # "auto" or "permission"
+    thinking_mode: bool = True  # "thinking" or "normal"
     allowed_tools_session: Set[str] = field(default_factory=set)
     allowed_tools_once: Set[str] = field(default_factory=set)
 
@@ -31,6 +32,11 @@ class AppState:
             self.mode = mode
         else:
             raise ValueError("Mode must be 'auto' or 'permission'")
+
+    def toggle_thinking_mode(self) -> str:
+        """Toggle thinking mode between True and False. Returns new mode label."""
+        self.thinking_mode = not self.thinking_mode
+        return "thinking" if self.thinking_mode else "normal"
 
     def clear_allowed_tools(self) -> None:
         """Clear all session and once permission caches."""
