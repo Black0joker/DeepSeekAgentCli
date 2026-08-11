@@ -1,0 +1,1502 @@
+from html.parser import HTMLParser
+import sys
+from typing import Any, Dict, Generator
+import subprocess
+from app.agent.logger import Logger
+from app.agent.config import Config
+import requests
+import json
+import base64
+import time
+import os,shutil,shlex
+import uuid,re
+import glob as glob_module
+import threading
+from pathlib import Path
+from app.agent.algorithmFunction import compute_pow_answer
+from app.agent.edit_file import edit_file as advanced_edit_file
+
+
+# Global working directory that can be updated dynamically
+CURRENT_PATH = os.getcwd()
+
+if getattr(sys, 'frozen', False):
+    _BASE = Path(sys.executable).parent
+else:
+    _BASE = Path(__file__).parent.parent.parent
+
+# Background process tracking
+BACKGROUND_PROCESSES = {}
+PLAN_MODE_ENABLED = False
+_plan_mode_lock = threading.Lock()
+
+# Cached workspace path to avoid repeated os.path.abspath calls
+_CACHED_WORKSPACE_PATH = None
+
+
+class _DDGParser(HTMLParser):
+    """Reusable DuckDuckGo HTML parser. Defined at module level to avoid
+    redefining the class on every google_web_search call."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.in_result = False
+        self.current = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == 'a' and 'result__a' in attrs_dict.get('class', ''):
+            self.in_result = True
+            self.current = {'url': attrs_dict.get('href', ''), 'title': '', 'snippet': ''}
+
+    def handle_data(self, data):
+        if self.in_result and self.current:
+            self.current['title'] += data.strip()
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.in_result:
+            self.in_result = False
+            if self.current.get('url'):
+                self.results.append(self.current)
+
+def _get_workspace_path():
+    """Get cached absolute workspace path. Recomputes only when CURRENT_PATH changes."""
+    global _CACHED_WORKSPACE_PATH
+    if _CACHED_WORKSPACE_PATH is None or _CACHED_WORKSPACE_PATH[0] != CURRENT_PATH:
+        _CACHED_WORKSPACE_PATH = (CURRENT_PATH, os.path.abspath(CURRENT_PATH))
+    return _CACHED_WORKSPACE_PATH[1]
+
+# Pre-compiled regex for grep_search to avoid recompilation
+_GREP_PATTERN_CACHE = {}
+_MAX_GREP_CACHE_SIZE = 32
+
+def _get_compiled_pattern(pattern_str):
+    """Get a compiled regex pattern from cache, compiling if necessary."""
+    if pattern_str in _GREP_PATTERN_CACHE:
+        return _GREP_PATTERN_CACHE[pattern_str]
+    compiled = re.compile(pattern_str)
+    # Evict oldest entries if cache is full
+    if len(_GREP_PATTERN_CACHE) >= _MAX_GREP_CACHE_SIZE:
+        oldest_key = next(iter(_GREP_PATTERN_CACHE))
+        del _GREP_PATTERN_CACHE[oldest_key]
+    _GREP_PATTERN_CACHE[pattern_str] = compiled
+    return compiled
+
+# Cache for shutil.which results to avoid repeated filesystem lookups
+_WHICH_CACHE = {}
+_state_lock = threading.Lock()
+
+def _which_cached(cmd):
+    """Cached version of shutil.which to avoid repeated PATH lookups (thread-safe)."""
+    with _state_lock:
+        if cmd not in _WHICH_CACHE:
+            _WHICH_CACHE[cmd] = shutil.which(cmd)
+        return _WHICH_CACHE[cmd]
+
+
+def _resolve_cwd(cwd: str) -> str:
+    """Resolve a cwd argument to an absolute path relative to CURRENT_PATH."""
+    if os.path.isabs(cwd):
+        return cwd
+    return os.path.abspath(os.path.join(CURRENT_PATH, cwd))
+
+
+def _parse_command(command: str):
+    """Parse a command string into (args_list, first_command).
+    Falls back to whitespace splitting if shlex fails."""
+    try:
+        parsed = shlex.split(command, posix=True)
+        if not parsed:
+            return [], ""
+        return parsed, parsed[0]
+    except ValueError:
+        parts = command.split()
+        if not parts:
+            return [], ""
+        return parts, parts[0]
+
+
+def _execute_subprocess(command: str, parsed_cmd, first_cmd: str, cwd: str, timeout):
+    """Execute via native binary if available, otherwise via PowerShell."""
+    if _which_cached(first_cmd):
+        return subprocess.run(
+            parsed_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    return subprocess.run(
+        ["powershell", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=cwd,
+    )
+
+
+def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: str, cwd: str, timeout):
+    """Execute a background process with streaming output.
+
+    Uses subprocess.Popen to read output incrementally as it is produced,
+    updating the shared output buffer so that read_background_output can
+    return partial results while the process is still running.
+    The thread releases all resources (process handles, pipes) upon completion.
+    """
+    proc = None
+    try:
+        # Use Popen for streaming output (merge stderr into stdout)
+        if _which_cached(first_cmd):
+            proc = subprocess.Popen(
+                parsed_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=cwd,
+            )
+        else:
+            proc = subprocess.Popen(
+                ["powershell", "-Command", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=cwd,
+            )
+
+        # Store the process object for external status checking / kill
+        with _state_lock:
+            if proc_id in BACKGROUND_PROCESSES:
+                BACKGROUND_PROCESSES[proc_id]["process"] = proc
+
+        # Stream output line by line into the shared buffer
+        output_lines = []
+        start_time = time.time()
+
+        for line in proc.stdout:
+            output_lines.append(line)
+            # Update the shared output buffer so readers can see partial output
+            with _state_lock:
+                if proc_id in BACKGROUND_PROCESSES:
+                    BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
+            # Check timeout
+            if timeout and (time.time() - start_time) > timeout:
+                proc.kill()
+                proc.wait()
+                with _state_lock:
+                    if proc_id in BACKGROUND_PROCESSES:
+                        BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines) + f"\nProcess timed out after {timeout}s"
+                        BACKGROUND_PROCESSES[proc_id]["status"] = "timeout"
+                return
+
+        # Wait for process to fully exit and get return code
+        proc.wait()
+        returncode = proc.returncode
+
+        with _state_lock:
+            if proc_id in BACKGROUND_PROCESSES:
+                BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
+                BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
+                BACKGROUND_PROCESSES[proc_id]["returncode"] = returncode
+
+    except Exception as ex:
+        with _state_lock:
+            if proc_id in BACKGROUND_PROCESSES:
+                BACKGROUND_PROCESSES[proc_id]["output"] = str(ex)
+                BACKGROUND_PROCESSES[proc_id]["status"] = "failed"
+    finally:
+        # Release process resources (close pipes, ensure process is dead)
+        if proc is not None:
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
+def _handle_shell_command(arguments: dict):
+    """Handle the run_shell_command tool with full validation."""
+    command = arguments.get('command')
+    if not command:
+        return {
+            "status": "error",
+            "tool": "run_shell_command",
+            "result": {"error_msg": "Missing 'command' argument"}
+        }
+
+    # Validate timeout
+    timeout = arguments.get('timeout')
+    if timeout is not None:
+        try:
+            timeout = int(timeout)
+        except (ValueError, TypeError):
+            return {
+                "status": "error",
+                "tool": "run_shell_command",
+                "result": {"error_msg": f"Invalid timeout value: {timeout!r}"}
+            }
+    else:
+        timeout = 1800
+    
+
+    cwd = arguments.get('cwd', '.')
+    resolved_cwd = _resolve_cwd(cwd)
+
+    # Validate working directory exists
+    if not os.path.isdir(resolved_cwd):
+        return {
+            "status": "error",
+            "tool": "run_shell_command",
+            "result": {"error_msg": f"Working directory does not exist: {resolved_cwd}"}
+        }
+
+    parsed_cmd, first_cmd = _parse_command(command)
+    if not parsed_cmd:
+        return {
+            "status": "error",
+            "tool": "run_shell_command",
+            "result": {"error_msg": "Empty command"}
+        }
+
+    # Background execution
+    if arguments.get('background', False):
+        proc_id = str(uuid.uuid4())[:8]
+        with _state_lock:
+            BACKGROUND_PROCESSES[proc_id] = {
+                "command": command,
+                "status": "running",
+                "output": "",
+                "thread": None,
+                "process": None,
+                "returncode": None
+            }
+        t = threading.Thread(
+            target=_run_background_process,
+            args=(proc_id, command, parsed_cmd, first_cmd, resolved_cwd, None),
+            daemon=True,
+        )
+        with _state_lock:
+            BACKGROUND_PROCESSES[proc_id]["thread"] = t
+        t.start()
+        Logger.info(f"Background process started: id={proc_id}, command={command}")
+        return {
+            "status": "success",
+            "tool": "run_shell_command",
+            "command": command,
+            "result": {
+                "background_id": proc_id,
+                "message": f"Process started in background with id {proc_id}"
+            }
+        }
+
+    # Foreground execution
+    try:
+        result = _execute_subprocess(command, parsed_cmd, first_cmd, resolved_cwd, timeout)
+        return {
+            "status": "success",
+            "tool": "run_shell_command",
+            "command": command,
+            "result": {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+            }
+        }
+    except subprocess.TimeoutExpired as e:
+        Logger.warn(f"Tool 'run_shell_command' timed out after {timeout}s: command={command}")
+        stdout = e.stdout.decode() if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or '')
+        stderr = e.stderr.decode() if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or '')
+        return {
+            "status": "success",
+            "tool": "run_shell_command",
+            "result": {
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": -1,
+            }
+        }
+
+
+def _handle_list_background_processes() -> dict:
+    """Handle the list_background_processes tool with thread-safe state access.
+    
+    Returns completed processes on first request, then removes them from
+    tracking and joins (closes) their threads after returning.
+    """
+    processes = []
+    threads_to_join = []
+
+    with _state_lock:
+        completed_ids = []
+        for proc_id, proc_info in list(BACKGROUND_PROCESSES.items()):
+            thread = proc_info.get("thread")
+            actual_status = proc_info["status"]
+            
+            # Refresh status from thread state
+            if thread is not None:
+                if thread.is_alive():
+                    actual_status = "running"
+                elif actual_status == "running":
+                    actual_status = "completed"
+                    BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
+
+            # Include in the response (so the user sees it on first request)
+            processes.append({
+                "id": proc_id,
+                "command": proc_info["command"],
+                "status": actual_status,
+                "source": "tracked"
+            })
+
+            # If completed, mark for cleanup AFTER the response is built
+            if actual_status == "completed":
+                completed_ids.append(proc_id)
+                if thread is not None:
+                    threads_to_join.append(thread)
+
+        # Remove completed processes from tracking (after including them in response)
+        for proc_id in completed_ids:
+            del BACKGROUND_PROCESSES[proc_id]
+
+        tracked_count = len(BACKGROUND_PROCESSES)
+
+    # Join (close) completed threads outside the lock
+    for t in threads_to_join:
+        t.join(timeout=1)
+
+    Logger.info(f"list_background_processes called: {len(processes)} total ({tracked_count} tracked)")
+    return {
+        "status": "success",
+        "tool": "list_background_processes",
+        "result": {
+            "processes": processes,
+            "tracked_count": tracked_count,
+        }
+    }
+
+
+def _handle_read_background_output(arguments: dict) -> dict:
+    """Handle the read_background_output tool with validation and thread-safe access.
+    
+    Returns the completed process output on first read, then removes it from
+    tracking and joins (closes) its thread after returning.
+    """
+    proc_id = arguments.get('id')
+    if not proc_id:
+        return {
+            "status": "error",
+            "tool": "read_background_output",
+            "result": {"error_msg": "Missing 'id' argument"}
+        }
+    
+    thread_to_join = None
+    
+    with _state_lock:
+        if proc_id not in BACKGROUND_PROCESSES:
+            return {
+                "status": "error",
+                "tool": "read_background_output",
+                "result": {"error_msg": f"Process {proc_id} not found"}
+            }
+        
+        proc_info = BACKGROUND_PROCESSES[proc_id]
+        
+        # Refresh status from thread state if needed
+        thread = proc_info.get("thread")
+        actual_status = proc_info["status"]
+        if thread is not None:
+            if thread.is_alive():
+                actual_status = "running"
+            elif actual_status == "running":
+                actual_status = "completed"
+        
+        # Build the result FIRST (so the user receives the data)
+        result = {
+            "status": "success",
+            "tool": "read_background_output",
+            "result": {
+                "output": proc_info["output"],
+                "status": actual_status
+            }
+        }
+        
+        # If completed, remove from tracking and schedule thread join AFTER returning
+        if actual_status == "completed":
+            if thread is not None:
+                thread_to_join = thread
+            del BACKGROUND_PROCESSES[proc_id]
+    
+    # Join (close) the thread outside the lock
+    if thread_to_join is not None:
+        thread_to_join.join(timeout=1)
+    
+    return result
+
+def _handle_kill_process(arguments: dict) -> dict:
+    """Handle the kill_process tool: terminate a background process by its ID."""
+    proc_id = arguments.get('id')
+    if not proc_id:
+        return {
+            "status": "error",
+            "tool": "kill_process",
+            "result": {"error_msg": "Missing 'id' argument"}
+        }
+
+    with _state_lock:
+        if proc_id not in BACKGROUND_PROCESSES:
+            return {
+                "status": "error",
+                "tool": "kill_process",
+                "result": {"error_msg": f"Process {proc_id} not found"}
+            }
+
+        proc_info = BACKGROUND_PROCESSES[proc_id]
+        process = proc_info.get("process")
+
+        if process is None:
+            return {
+                "status": "error",
+                "tool": "kill_process",
+                "result": {"error_msg": f"Process {proc_id} has no associated OS process"}
+            }
+
+        # Check if already terminated
+        if process.poll() is not None:
+            BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
+            return {
+                "status": "success",
+                "tool": "kill_process",
+                "result": {
+                    "id": proc_id,
+                    "message": f"Process {proc_id} was already terminated (exit code: {process.returncode})"
+                }
+            }
+
+        # Kill the process
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Force kill if graceful wait times out
+            process.kill()
+        except Exception as e:
+            return {
+                "status": "error",
+                "tool": "kill_process",
+                "result": {"error_msg": f"Failed to kill process {proc_id}: {e}"}
+            }
+
+        BACKGROUND_PROCESSES[proc_id]["status"] = "killed"
+        Logger.info(f"Process killed: id={proc_id}, command={proc_info['command']}")
+
+    return {
+        "status": "success",
+        "tool": "kill_process",
+        "result": {
+            "id": proc_id,
+            "message": f"Process {proc_id} has been killed"
+        }
+    }
+
+
+def set_working_directory(path):
+    """Update the global working directory for tool operations."""
+    global CURRENT_PATH, _CACHED_WORKSPACE_PATH
+    abs_path = os.path.abspath(path)
+    if os.path.isdir(abs_path):
+        CURRENT_PATH = abs_path
+        # Invalidate workspace path cache
+        _CACHED_WORKSPACE_PATH = None
+        return True
+    return False
+
+def get_working_directory():
+    """Get the current working directory for tool operations."""
+    return CURRENT_PATH
+
+class DeepSeekClient:
+    """Client for interacting with the DeepSeek chat API."""
+    def __init__(self, cookies, headers):
+        self.session = requests.Session()
+
+        self.session.cookies.update(cookies)
+        self.session.headers.update(headers)
+        self.base_url = "https://chat.deepseek.com/api/v0"
+        self.gator_url = "https://gator.volces.com/list"
+        self.session_id = str(uuid.uuid4())
+        self.web_id = "7642988951426344972" # Should be dynamic in production
+        self.user_unique_id = str(uuid.uuid4())
+
+    def _report_telemetry(self, event, params):
+        """Reports telemetry events to the Volcano Engine logger."""
+        payload = [{
+            "events": [{
+                "event": event,
+                "params": json.dumps(params),
+                "local_time_ms": int(time.time() * 1000),
+                "is_bav": 0,
+                "session_id": self.session_id
+            }],
+            "user": {
+                "user_unique_id": self.user_unique_id,
+                "web_id": self.web_id
+            },
+            "header": {
+                "app_id": 20006317,
+                "os_name": "windows",
+                "platform": "web",
+                "browser": "Chrome",
+                "browser_version": "149.0.0.0"
+            },
+            "local_time": int(time.time()),
+            "verbose": 1
+        }]
+        # Reporting telemetry usually doesn't raise error on failure in production
+        try:
+            self.session.post(self.gator_url, json=payload)
+        except Exception as e:
+            Logger.error(f"Telemetry reporting failed: {e}")
+
+    def _request(self, method, url, **kwargs):
+        """Centralized request method with standard error handling."""
+        try:
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            Logger.error(f"API request failed: {e}")
+            raise
+
+    def create_chat(self):
+        """Creates a new chat session."""
+        Logger.info("Creating new chat session...")
+        response = self._request("POST", f"{self.base_url}/chat_session/create", json={})
+        session_id = response.json()["data"]['biz_data']['chat_session']["id"]
+        Logger.success(f"Chat session created: {session_id}")
+        return session_id
+
+    def fetch_chats(self):
+        """Fetches a list of chat sessions."""
+        Logger.info("Fetching chat sessions...")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat_session/fetch_page",
+            params={"lte_cursor.pinned": "false"}
+        )
+        chats = response.json()["data"]["biz_data"]["chat_sessions"]
+        Logger.success(f"Fetched {len(chats)} chat sessions.")
+        return chats
+
+    def get_chat_history(self, chat_session_id):
+        """Gets the history messages for a given chat session."""
+        Logger.info(f"Fetching chat history for session: {chat_session_id}")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat/history_messages",
+            params={"chat_session_id": chat_session_id}
+        )
+        history = response.json()["data"]["biz_data"]
+        Logger.success(f"Fetched history for session: {chat_session_id}")
+        return history
+    
+    def get_last_message_id(self, chat_session_id):
+        """Gets the history messages for a given chat session."""
+        Logger.info(f"Fetching chat history for session: {chat_session_id}")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat/history_messages",
+            params={"chat_session_id": chat_session_id}
+        )
+        messageId = response.json()["data"]["biz_data"]['chat_session']['current_message_id']
+        Logger.success(f"Fetched history for session: {chat_session_id}")
+        return int(messageId)
+
+
+    def _solve_pow(self, target_path, scene):
+        """Acquires, solves, and reports telemetry for the PoW challenge."""
+        
+        # 1. Request challenge
+        response = self._request(
+            "POST",
+            f"{self.base_url}/chat/create_pow_challenge",
+            json={"target_path": target_path}
+        )
+        challenge_data = response.json()["data"]["biz_data"]["challenge"]
+        
+        # 2. Report Start Telemetry
+        self._report_telemetry("preparePowChallengeAndSolve", {"ds_scene": scene})
+        self._report_telemetry("powSolveChallengeStart", {"ds_scene": scene})
+        
+        # 3. Solve
+        start_time = time.time()
+        wasm_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sha3_wasm_bg.7b9ca65ddd.wasm')
+        if not os.path.exists(wasm_file):
+            raise FileNotFoundError(f"Required WASM file not found: {wasm_file}")
+            
+        answer = compute_pow_answer(
+            algorithm=challenge_data["algorithm"],
+            challenge_str=challenge_data["challenge"],
+            salt=challenge_data["salt"],
+            difficulty=challenge_data["difficulty"],
+            expire_at=challenge_data["expire_at"],
+            signature=challenge_data["signature"],
+            target_path=challenge_data["target_path"],
+            wasm_path=wasm_file
+        )
+        duration = (time.time() - start_time) * 1000
+        
+        # 4. Report Success Telemetry
+        self._report_telemetry("powSolveChallengeSuccess", {"ds_scene": scene, "ds_duration": duration})
+        self._report_telemetry("powPrepared", {"ds_scene": scene, "ds_answer": answer, "ds_duration": duration})
+        
+        challenge_data["answer"] = answer
+        
+        # 5. Prepare payload
+        payload = {
+            "algorithm": challenge_data["algorithm"],
+            "challenge": challenge_data["challenge"],
+            "salt": challenge_data["salt"],
+            "answer": challenge_data["answer"],
+            "signature": challenge_data["signature"],
+            "target_path": challenge_data['target_path'],
+        }
+        
+        json_str = json.dumps(payload, separators=(",", ":"))
+        return base64.b64encode(json_str.encode()).decode()
+
+    def send_prompt(self, prompt, chat_session_id, parent_message_id=None,thinking_mode=True):
+        """Sends a prompt to the specified chat session."""
+        target_path = "/api/v0/chat/completion"
+        pow_token = self._solve_pow(target_path, "completion_like")
+
+        headers = self.session.headers.copy()
+        headers["x-ds-pow-response"] = pow_token
+
+        json_data = {
+            'chat_session_id': chat_session_id,
+            'parent_message_id': parent_message_id,
+            'model_type': 'expert',
+            'prompt': prompt,
+            'ref_file_ids': [],
+            'thinking_enabled': thinking_mode,
+            'search_enabled': False,
+            'action': None,
+            'preempt': False,
+        }
+
+        response = self._request(
+            "POST",
+            f"{self.base_url}/chat/completion",
+            headers=headers,
+            json=json_data,
+            stream=True
+        )
+        return response
+
+
+def replace_code(file_path, old_code, new_code):
+    path = Path(file_path)
+
+    text = path.read_text(encoding="utf-8")
+
+    if old_code not in text:
+        return False
+
+    text = text.replace(old_code, new_code)
+
+    path.write_text(text, encoding="utf-8")
+    return True
+
+def full_parse_sse(response) -> Generator[Dict[str, Any], None, None]:
+    """
+    Supports both protocols.
+
+    Automatically detects the protocol:
+
+        conversation_mode exists  -> normal protocol
+        otherwise                 -> thinking protocol
+    """
+
+    STATUS_RE = re.compile(r'"status"\s*:\s*"([^"]+)"')
+
+    message_sent = False
+    status_sent = False
+
+    protocol = None          # "normal" | "thinking"
+
+    collecting = False
+    content = ""
+
+    # action parser state
+    actions_started = False
+    action_start = None
+    brace_depth = 0
+    in_string = False
+    escaped = False
+    scan_index = 0
+
+    for line in response.iter_lines(decode_unicode=True):
+
+        # line = str(line).removeprefix("data: ")
+
+        Logger.warn(f"Received line: {line}")
+
+        if not line.startswith("data: "):
+            continue
+
+        try:
+            obj = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+
+        # ------------------------------------------------------
+        # Initial response
+        # ------------------------------------------------------
+
+        if (
+            not message_sent
+            and isinstance(obj.get("v"), dict)
+            and "response" in obj["v"]
+        ):
+
+            response_obj = obj["v"]["response"]
+
+            protocol = (
+                "normal"
+                if "conversation_mode" in response_obj
+                else "thinking"
+            )
+
+            message_id = response_obj.get("message_id")
+
+            if message_id is not None:
+                message_sent = True
+                yield {
+                    "type": "message_id",
+                    "value": message_id,
+                }
+
+            # Normal protocol may already contain a RESPONSE fragment.
+            if protocol == "normal":
+
+                fragments = response_obj.get("fragments", [])
+
+                if fragments:
+
+                    last = fragments[-1]
+
+                    if last.get("type") == "RESPONSE":
+                        collecting = True
+                        content = last.get("content", "")
+
+            continue
+
+        # ------------------------------------------------------
+        # NORMAL PROTOCOL
+        # ------------------------------------------------------
+
+        if protocol == "normal":
+
+            if (
+                obj.get("p") == "response/fragments"
+                and obj.get("o") == "APPEND"
+            ):
+
+                fragments = obj.get("v", [])
+
+                if fragments:
+
+                    fragment = fragments[0]
+
+                    if fragment.get("type") == "RESPONSE":
+
+                        collecting = True
+                        content = fragment.get("content", "")
+
+                        actions_started = False
+                        action_start = None
+                        brace_depth = 0
+                        in_string = False
+                        escaped = False
+                        scan_index = 0
+
+                        continue
+
+            elif collecting:
+
+                path = obj.get("p")
+
+                if (
+                    path == "response/fragments/-1/content"
+                    or (
+                        path is None
+                        and isinstance(obj.get("v"), str)
+                    )
+                ):
+                    content += obj["v"]
+                else:
+                    continue
+
+            else:
+                continue
+
+        # ------------------------------------------------------
+        # THINKING PROTOCOL
+        # ------------------------------------------------------
+
+        else:
+
+            path = obj.get("p")
+
+            if path == "response/thinking_content":
+                collecting = False
+                continue
+
+            if path == "response/content":
+                collecting = True
+
+            elif path is not None:
+                collecting = False
+
+            if not collecting:
+                continue
+
+            value = obj.get("v")
+
+            if not isinstance(value, str):
+                continue
+
+            content += value
+
+        # ------------------------------------------------------
+        # STATUS
+        # ------------------------------------------------------
+
+        if not status_sent:
+
+            match = STATUS_RE.search(content)
+
+            if match:
+
+                status_sent = True
+
+                yield {
+                    "type": "status",
+                    "value": match.group(1),
+                }
+
+        # ------------------------------------------------------
+        # Find actions array
+        # ------------------------------------------------------
+
+        if not actions_started:
+
+            idx = content.find('"actions"')
+
+            if idx != -1:
+
+                bracket = content.find("[", idx)
+
+                if bracket != -1:
+
+                    actions_started = True
+                    scan_index = bracket + 1
+
+        if not actions_started:
+            continue
+
+        # ------------------------------------------------------
+        # Stream actions one-by-one
+        # ------------------------------------------------------
+
+        while scan_index < len(content):
+
+            ch = content[scan_index]
+
+            if escaped:
+                escaped = False
+
+            elif ch == "\\":
+                escaped = True
+
+            elif ch == '"':
+                in_string = not in_string
+
+            elif not in_string:
+
+                if ch == "{":
+
+                    if brace_depth == 0:
+                        action_start = scan_index
+
+                    brace_depth += 1
+
+                elif ch == "}":
+
+                    brace_depth -= 1
+
+                    if brace_depth == 0 and action_start is not None:
+
+                        action_json = content[action_start:scan_index + 1]
+
+                        try:
+                            yield {
+                                "type": "action",
+                                "value": json.loads(action_json),
+                            }
+                        except json.JSONDecodeError:
+                            pass
+
+                        action_start = None
+
+            scan_index += 1
+
+
+def load_system_prompt(path: str = "sys.md") -> str:
+    """Loads the system prompt from the specified file."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def create_client() -> DeepSeekClient:
+    """Creates and configures a DeepSeekClient using validated configuration."""
+    Config.load()
+    return DeepSeekClient(Config.get_cookies(), Config.get_headers())
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+EXPECTED_TOOLS=[
+  {
+    "tool": "current_path",
+    "arguments": {}
+  },
+  {
+    "tool": "list_directory",
+    "arguments": {
+      "path": "string"
+    }
+  },
+  {
+    "tool": "glob",
+    "arguments": {
+      "pattern": "string",
+      "path": "string (optional)"
+    }
+  },
+  {
+    "tool": "grep_search",
+    "arguments": {
+      "pattern": "string",
+      "path": "string (optional)",
+      "include": "string (optional)"
+    }
+  },
+  {
+    "tool": "read_file",
+    "arguments": {
+      "path": "string"
+    }
+  },
+  {
+    "tool": "replace",
+    "arguments": {
+      "path": "string",
+      "search": "string",
+      "replace": "string"
+    }
+  },
+  {
+    "tool": "write_file",
+    "arguments": {
+      "path": "string",
+      "content": "string"
+    }
+  },
+  {
+    "tool": "run_shell_command",
+    "arguments": {
+      "command": "string",
+      "cwd": "string (optional)",
+      "timeout": "integer (optional)"
+    }
+  },
+  {
+    "tool": "list_background_processes",
+    "arguments": {}
+  },
+  {
+    "tool": "read_background_output",
+    "arguments": {
+      "id": "string"
+    }
+  },
+  {
+    "tool": "kill_process",
+    "arguments": {
+      "id": "string"
+    }
+  },
+  {
+    "tool": "enter_plan_mode",
+    "arguments": {
+      "plan": "boolean (true to enter plan mode, false to exit plan mode)"
+    }
+  },
+  {
+    "tool": "google_web_search",
+    "arguments": {
+      "query": "string"
+    }
+  },
+  {
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "string"
+    }
+  },
+  {
+    "tool": "ask_user",
+    "arguments": {
+      "question": "string"
+    }
+  },
+  {
+    "tool": "user_response",
+    "arguments": {
+      "description": "string"
+    }
+  }
+]
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+def execute_tool(name: str, arguments: dict):
+    """Executes a tool by name with the provided arguments."""
+    # Security: Validate file paths to prevent path traversal
+    if name in ('read_file', 'write_file', 'replace', 'list_directory', 'run_shell_command'):
+        if 'path' in arguments or 'cwd' in arguments:
+            # Use cached workspace path to avoid repeated os.path.abspath
+            workspace_path = CURRENT_PATH
+            
+            # Determine the target path to validate
+            if name == 'run_shell_command':
+                target_cwd = arguments.get('cwd', '.')
+                target_path = os.path.abspath(os.path.join(CURRENT_PATH, target_cwd))
+            else:
+                target_path = os.path.abspath(os.path.join(CURRENT_PATH, arguments['path']))
+            
+            # Fast prefix check before expensive commonpath call
+            # Normalize both paths with trailing separator for accurate prefix matching
+            norm_target = target_path.rstrip(os.sep) + os.sep
+            norm_workspace = workspace_path.rstrip(os.sep) + os.sep
+            
+            if not norm_target.startswith(norm_workspace) and target_path != workspace_path:
+                # Double-check with commonpath for edge cases (symlinks, case sensitivity)
+                try:
+                    common = os.path.commonpath([target_path, workspace_path])
+                    if common != workspace_path:
+                        error_msg = "Path traversal detected: path must be within workspace directory"
+                        Logger.error(f"Tool '{name}' blocked: {error_msg} (path={arguments.get('path', arguments.get('cwd', ''))})")
+                        return {
+                            "status": "error",
+                            "tool": name,
+                            "result": {
+                                "path": arguments.get('path', arguments.get('cwd', '')),
+                                "error_msg": error_msg
+                            }
+                        }
+                except ValueError:
+                    error_msg = "Path traversal detected: path must be within workspace directory"
+                    Logger.error(f"Tool '{name}' blocked: {error_msg} (path={arguments.get('path', arguments.get('cwd', ''))})")
+                    return {
+                        "status": "error",
+                        "tool": name,
+                        "result": {
+                            "path": arguments.get('path', arguments.get('cwd', '')),
+                            "error_msg": error_msg
+                        }
+                    }
+    
+    try:
+        if name == "run_shell_command":
+            return _handle_shell_command(arguments)
+            
+        elif name=="current_path":
+            return {
+                    "status": "success",
+                    "tool": "current_path",
+                    "result": {
+                        "path": CURRENT_PATH
+                    },
+                }
+
+        elif name == "list_directory":
+            try:
+                target_path = os.path.join(CURRENT_PATH, arguments['path'])
+                entries = os.listdir(target_path)
+                return {
+                    "status": "success",
+                    "tool": "list_directory",
+                    "path": arguments['path'],
+                    "result": {
+                        "entries": entries
+                    }
+                }
+            except PermissionError as e:
+                Logger.error(f"Tool 'list_directory' failed: Permission denied for path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "list_directory",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"Permission denied: {e}"
+                    }
+                }
+            except FileNotFoundError as e:
+                Logger.error(f"Tool 'list_directory' failed: Directory not found path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "list_directory",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"Directory not found: {e}"
+                    }
+                }
+        
+        elif name=="search_file" or name=="glob":
+            try:
+                matches = []
+                search_path = os.path.join(CURRENT_PATH, arguments.get('path', '.'))
+                pattern = arguments['pattern']
+                full_pattern = os.path.join(search_path, pattern)
+                for match in glob_module.glob(full_pattern, recursive=True):
+                    matches.append(os.path.relpath(match, CURRENT_PATH))
+                return {
+                    "status": "success",
+                    "tool": name,
+                    "path": arguments.get('path', '.'),
+                    "result": {
+                        "pattern": pattern,
+                        "matches": matches
+                    }
+                }
+            except PermissionError as e:
+                Logger.error(f"Tool '{name}' failed: Permission denied for path={arguments.get('path', '.')} ({e})")
+                return {
+                    "status": "error",
+                    "tool": name,
+                    "result": {
+                        "path": arguments.get('path', '.'),
+                        "error_msg": f"Permission denied: {e}"
+                    }
+                }
+            except FileNotFoundError as e:
+                Logger.error(f"Tool '{name}' failed: Directory not found path={arguments.get('path', '.')} ({e})")
+                return {
+                    "status": "error",
+                    "tool": name,
+                    "result": {
+                        "path": arguments.get('path', '.'),
+                        "error_msg": f"Directory not found: {e}"
+                    }
+                }
+
+        elif name=="grep_search":
+            try:
+                results = []
+                search_path = os.path.join(CURRENT_PATH, arguments.get('path', '.'))
+                # Use cached compiled pattern to avoid recompilation on repeated searches
+                pattern = _get_compiled_pattern(arguments['pattern'])
+                include = arguments.get('include', '*')
+                # Pre-compute relpath base to avoid repeated string operations
+                current_path_norm = CURRENT_PATH
+                max_results = 500  # Cap results to prevent memory issues on large codebases
+
+                # If search_path is a file, search it directly instead of globbing
+                if os.path.isfile(search_path):
+                    try:
+                        with open(search_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            rel_file = os.path.relpath(search_path, current_path_norm)
+                            for line_num, line in enumerate(f, 1):
+                                if pattern.search(line):
+                                    results.append({
+                                        "file": rel_file,
+                                        "line": line_num,
+                                        "content": line.rstrip()
+                                    })
+                                    if len(results) >= max_results:
+                                        break
+                    except (PermissionError, UnicodeDecodeError):
+                        pass
+                else:
+                    full_pattern = os.path.join(search_path, '**', include)
+                    for filepath in glob_module.glob(full_pattern, recursive=True):
+                        if os.path.isfile(filepath):
+                            try:
+                                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                    rel_file = os.path.relpath(filepath, current_path_norm)
+                                    for line_num, line in enumerate(f, 1):
+                                        if pattern.search(line):
+                                            results.append({
+                                                "file": rel_file,
+                                                "line": line_num,
+                                                "content": line.rstrip()
+                                            })
+                                            if len(results) >= max_results:
+                                                break
+                            except (PermissionError, UnicodeDecodeError):
+                                continue
+                        if len(results) >= max_results:
+                            break
+                return {
+                    "status": "success",
+                    "tool": "grep_search",
+                    "result": {
+                        "results": results
+                    }
+                }
+            except Exception as e:
+                Logger.error(f"Tool 'grep_search' failed: {e}")
+                return {
+                    "status": "error",
+                    "tool": "grep_search",
+                    "result": {
+                        "error_msg": str(e)
+                    }
+                }
+
+        elif name=="list_background_processes":
+            return _handle_list_background_processes()
+
+        elif name=="read_background_output":
+            return _handle_read_background_output(arguments)
+
+        elif name=="kill_process":
+            return _handle_kill_process(arguments)
+
+        elif name=="enter_plan_mode":
+            global PLAN_MODE_ENABLED
+            plan_value = arguments.get('plan', True)
+            # Accept both bool and string representations
+            if isinstance(plan_value, str):
+                plan_value = plan_value.lower() in ('true', '1', 'yes')
+            with _plan_mode_lock:
+                PLAN_MODE_ENABLED = bool(plan_value)
+            return {
+                "status": "success",
+                "tool": "enter_plan_mode",
+                "result": {
+                    "mode": "plan" if PLAN_MODE_ENABLED else "normal",
+                    "plan_enabled": PLAN_MODE_ENABLED
+                }
+            }
+
+        elif name=="google_web_search":
+            try:
+                query = arguments['query']
+                # Use DuckDuckGo HTML search as fallback (no API key needed)
+                search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+                resp = requests.get(search_url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+                results = []
+                # Simple parsing of DDG HTML results - parser class defined at module level for reuse
+                parser = _DDGParser()
+                parser.feed(resp.text)
+                results = [{'title': r['title'], 'url': r['url'], 'snippet': ''} for r in parser.results[:10]]
+                return {
+                    "status": "success",
+                    "tool": "google_web_search",
+                    "result": {
+                        "results": results
+                    }
+                }
+            except Exception as e:
+                Logger.error(f"Tool 'google_web_search' failed: {e}")
+                return {
+                    "status": "error",
+                    "tool": "google_web_search",
+                    "result": {
+                        "error_msg": str(e)
+                    }
+                }
+
+        elif name=="web_fetch":
+            try:
+                resp = requests.get(arguments['url'], timeout=30)
+                return {
+                    "status": "success",
+                    "tool": "web_fetch",
+                    "result": {
+                        "content": resp.text[:10000],  # Limit content size
+                        "status_code": resp.status_code
+                    }
+                }
+            except Exception as e:
+                Logger.error(f"Tool 'web_fetch' failed: {e}")
+                return {
+                    "status": "error",
+                    "tool": "web_fetch",
+                    "result": {
+                        "error_msg": str(e)
+                    }
+                }
+
+        elif name == "write_file":
+            try:
+                file_path = Path(os.path.join(CURRENT_PATH, arguments['path']))
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(arguments["content"])
+
+                return {
+                    "status": "success",
+                    "tool": "write_file",
+                    "result": {
+                        "path": arguments['path']
+                    }
+                }
+            except PermissionError as e:
+                Logger.error(f"Tool 'write_file' failed: Permission denied for path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "write_file",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"Permission denied: {e}"
+                    }
+                }
+            except OSError as e:
+                Logger.error(f"Tool 'write_file' failed: OS error for path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "write_file",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"OS error writing file: {e}"
+                    }
+                }
+
+        elif name == "read_file":
+            try:
+                file_path = os.path.join(CURRENT_PATH, arguments['path'])
+                with open(file_path, encoding="utf-8") as f:
+                    content = f.read()
+                return {
+                    "status": "success",
+                    "tool": "read_file",
+                    "path":arguments['path'],
+                    "result": {
+                        "content": content
+                    }
+                }
+            except FileNotFoundError as e:
+                Logger.error(f"Tool 'read_file' failed: File not found path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "read_file",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"File not found: {e}"
+                    }
+                }
+            except PermissionError as e:
+                Logger.error(f"Tool 'read_file' failed: Permission denied for path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "read_file",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"Permission denied: {e}"
+                    }
+                }
+            except UnicodeDecodeError as e:
+                Logger.error(f"Tool 'read_file' failed: Invalid UTF-8 for path={arguments['path']} ({e})")
+                return {
+                    "status": "error",
+                    "tool": "read_file",
+                    "path": arguments['path'],
+                    "result": {
+                        "error_msg": f"File is not valid UTF-8: {e}"
+                    }
+                }
+            
+        
+            
+        elif name=="replace":
+            edit_result = advanced_edit_file(
+                file_path=os.path.join(CURRENT_PATH, arguments['path']),
+                search=arguments['search'],
+                replace=arguments['replace'],
+                operation="replace"
+            )
+            if edit_result.success:
+                result_data = {
+                    "replacements_made": 1,
+                    "match_type": edit_result.match_type,
+                    "confidence": edit_result.confidence
+                }
+                if edit_result.diff_preview:
+                    result_data["diff_preview"] = edit_result.diff_preview
+                if edit_result.lines_added > 0:
+                    result_data["lines_added"] = edit_result.lines_added
+                if edit_result.lines_removed > 0:
+                    result_data["lines_removed"] = edit_result.lines_removed
+                if edit_result.start_line is not None:
+                    result_data["start_line"] = edit_result.start_line
+                if edit_result.end_line is not None:
+                    result_data["end_line"] = edit_result.end_line
+                return {
+                    "status": "success",
+                    "tool": "replace",
+                    "path": arguments['path'],
+                    "result": result_data
+                }
+            else:
+                Logger.error(f"Tool 'replace' failed: {edit_result.error} - {edit_result.message} (path={arguments['path']}, match_count={edit_result.match_count})")
+                error_result = {
+                    "error_msg": edit_result.message or "Target code not found.",
+                    "error_type": edit_result.error
+                }
+                if edit_result.hint:
+                    error_result["hint"] = edit_result.hint
+                if edit_result.suggested_action:
+                    error_result["suggested_action"] = edit_result.suggested_action
+                if edit_result.match_count > 0:
+                    error_result["match_count"] = edit_result.match_count
+                if edit_result.candidates:
+                    error_result["candidates"] = edit_result.candidates
+                return {
+                    "status": "error",
+                    "tool": "replace",
+                    "path": arguments['path'],
+                    "result": error_result
+                }
+        else:
+            Logger.error(f"Tool execution failed: Unknown tool '{name}' with args={arguments}")
+            return {
+                    "status": "error",
+                    "tool": "unknown tool",
+                    "result":{
+                        "tool":name,
+                        "args":arguments
+                    }
+                    }
+
+    except Exception as e:
+        Logger.error(f"Tool '{name}' failed with unexpected exception: {e} (args={arguments})")
+        return {
+            "status": "error",
+            "tool": name,
+            "result": {
+                "error_msg": str(e)
+            }
+        }
