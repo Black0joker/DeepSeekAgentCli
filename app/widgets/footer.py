@@ -54,6 +54,5 @@ class CustomFooter(Static):
                 parts.append(f"[dim]git:[/dim] [bold]#{branch}[/bold]")
             parts.append(f"[dim]mode:[/dim] [bold]{state.mode}[/bold]")
             parts.append(f"[dim]thinking:[/dim] [bold]{thinking_label}[/bold]")
-            parts.append("[dim]Ctrl+T toggle[/dim]")
             return "  │  ".join(parts)
         return "DeepSeekCli"
