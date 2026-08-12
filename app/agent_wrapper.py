@@ -168,7 +168,7 @@ class AgentWrapper:
                     return
                 
                 elif action['type'] == 'action':
-                    if Status == 'running' and (action['value']['tool'] == 'user_response' or action['value']['tool'] == 'ask_user') :
+                    if (Status == 'running' or Status == 'waiting') and (action['value']['tool'] == 'user_response' or action['value']['tool'] == 'ask_user') :
                         user_response = action['value']['arguments'].get('description', '')
                         self._call_callback('on_message', user_response)
                         continue
