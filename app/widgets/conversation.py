@@ -1,6 +1,7 @@
 from textual.widgets import Static
 from textual.containers import Container
 from rich.text import Text
+from rich.markdown import Markdown
 from typing import Union
 from app.theme import (
     BG_MAIN, BG_INPUT, TEXT_PRIMARY, TEXT_PRIMARY_RGB,
@@ -75,14 +76,13 @@ class ConversationView(Container):
 
             self.mount(container)
 
-        elif text.startswith("✦"):
-            # Assistant message
-            styled = Text()
-            styled.append("✦", style=ACCENT_RGB)
-            styled.append(text[1:], style=TEXT_PRIMARY_RGB)
+        elif text.startswith("\u2726"):
+            # Assistant message with Markdown rendering
+            content = text[1:].strip()
+            markdown = Markdown(content, code_theme="monokai")
 
             container = Container(
-                Static(styled),
+                markdown,
                 classes="assistant-message",
             )
 

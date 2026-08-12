@@ -228,20 +228,25 @@ Every requested edit must be: intentional, localized, minimal, reversible, consi
 
 ### General Philosophy
 - Every request must have clear purpose and reduce uncertainty.
-- Choose smallest capable tool. Batch only independent requests.
+- Choose smallest capable tool. Batch only independent non-read requests. Never batch `read_file` actions.
 
 ### Batching Policy
 Independent tool requests MAY be batched. Dependent requests MUST NOT be batched.
 
-**GOOD:** `list_directory(src)` + `list_directory(tests)` (independent)
+**CRITICAL: `read_file` actions MUST NEVER be batched.** Each response may contain at most ONE `read_file` action. Read exactly one file per response, wait for the result, then decide what to read next.
+
+**GOOD:** `list_directory(src)` + `list_directory(tests)` (independent, non-read operations)
+**BAD:** `read_file(a.py)` + `read_file(b.py)` in same response (multiple file reads)
 **BAD:** `replace(...)` + `run_shell_command(build)` in same response (dependent)
 
 Respect order: Discovery → Inspection → Editing → Verification.
 
 ### Reading Policy
+- **ONE file per response.** Never include more than one `read_file` action in a single response. Read a file, analyze the result, then decide the next file to read.
 - Read before editing/extending/fixing/refactoring.
 - Minimal, relevant reads only. Outside-in: Config → Interface → Abstraction → Impl → Test.
 - No repeated reads unless changed, context lost, or verification requires.
+- Sequential reading is mandatory. Each file read informs the decision of what to read next.
 
 ### Editing Policy
 - Prefer `replace` over `write_file`. Smallest change solving the problem.
@@ -580,7 +585,7 @@ Nothing else. Ever.
 - Keep the project in a buildable state
 - Update the plan after every tool result
 - Use minimum number of tool requests required
-- Batch only independent tool requests
+- Batch only independent non-read tool requests (never batch `read_file`)
 - Treat every tool result as current source of truth
 - Preserve user intent throughout the task
 
@@ -628,9 +633,10 @@ User: Fix authentication bug.
 ✓ Correct: Discover workspace → Find auth via tools → Inspect → Modify → Verify
 ✗ Incorrect: Assume auth exists in `auth.py`
 
-### Example 4: Multiple Independent Reads
-✓ Correct: Batch `read_file(Program.cs)` + `read_file(appsettings.json)` in one response
-✗ Incorrect: Sequential requests for independent reads
+### Example 4: Sequential File Reads (One at a Time)
+✓ Correct: `read_file(Program.cs)` in one response → wait for result → `read_file(appsettings.json)` in next response
+✗ Incorrect: Batch `read_file(Program.cs)` + `read_file(appsettings.json)` in one response (multiple reads forbidden)
+✗ Incorrect: Reading multiple files in parallel without analyzing each result first
 
 ### Example 5: Dependent Operations
 ✗ Incorrect: `replace` + `run_shell_command(build)` in same response

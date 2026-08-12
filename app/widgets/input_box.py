@@ -23,7 +23,10 @@ class InputBox(Input):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.placeholder = "Type your message or @path/to/file"
+        self.placeholder = "Type your message or /command"
+        self.history: list[str] = []
+        self.history_index: int = -1
+        self._current_draft: str = ""
 
     @property
     def text(self) -> str:
@@ -73,14 +76,53 @@ class InputBox(Input):
                 event.prevent_default()
                 return
 
+        # Input history navigation (Up/Down when no suggestions visible)
+        if event.key == "up" and not (suggestions and suggestions.display):
+            if self.history:
+                if self.history_index == -1:
+                    # Save current draft before navigating
+                    self._current_draft = self.text
+                    self.history_index = len(self.history) - 1
+                elif self.history_index > 0:
+                    self.history_index -= 1
+                self.text = self.history[self.history_index]
+                self.cursor_position = len(self.text)
+            event.prevent_default()
+            return
+        elif event.key == "down" and not (suggestions and suggestions.display):
+            if self.history and self.history_index >= 0:
+                if self.history_index < len(self.history) - 1:
+                    self.history_index += 1
+                    self.text = self.history[self.history_index]
+                else:
+                    # Back to the original draft
+                    self.history_index = -1
+                    self.text = self._current_draft
+                self.cursor_position = len(self.text)
+            event.prevent_default()
+            return
+
         if event.key == "enter":
             text = self.text
             if text.strip():
+                # Add to history (avoid consecutive duplicates)
+                if not self.history or self.history[-1] != text.strip():
+                    self.history.append(text.strip())
+                    # Keep history bounded to last 100 entries
+                    if len(self.history) > 100:
+                        self.history = self.history[-100:]
+                self.history_index = -1
+                self._current_draft = ""
                 self.text = ""
                 self.post_message(self.MessageSent(text.strip()))
             event.prevent_default()
             return
         elif event.key == "shift+enter":
+            # Insert newline at cursor position
+            current = self.text
+            pos = self.cursor_position
+            self.text = current[:pos] + "\n" + current[pos:]
+            self.cursor_position = pos + 1
             event.prevent_default()
             return
 

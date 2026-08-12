@@ -19,6 +19,7 @@ from .agent_wrapper import AgentWrapper
 from app.theme import (
     BG_MAIN, BG_INPUT, TEXT_PRIMARY, TEXT_SECONDARY,
     BORDER_LIGHT, BORDER_MEDIUM, ACCENT_RGB,
+    load_theme, list_presets, get_theme,
 )
 
 class MainApp(App):
@@ -128,6 +129,8 @@ class MainApp(App):
         self.query_one("#footer").refresh()
 
     def on_mount(self) -> None:
+        # Load theme (attempt config file or default)
+        load_theme()
         # Set workspace to actual current path
         self.state.set_workspace(os.getcwd())
         self.state.set_model("DeepSeek-V3")
@@ -187,30 +190,6 @@ class MainApp(App):
             return
         conversation = self.query_one("#conversation")
         status = self.query_one("#status")
-
-        # Permission requests are now handled via the selector, not via text input.
-        # Remove the old text-based permission handling.
-        # Keep only agent question handling.
-
-        # If we are waiting for a response to an agent question, handle it specially
-        # if self.waiting_for_agent_response and self.agent and self.agent.running:
-        #     # Display the user's response in the conversation
-        #     conversation.write(f"> (response) {text}")
-        #     # Set status to Thinking and disable input while agent processes
-        #     status_bar = self.query_one("#status")
-        #     status_bar.start_elapsed_timer("Thinking...")
-        #     input_box = self.query_one("#input_box")
-        #     input_box.disabled = True
-        #     # Provide the response to the agent
-        #     self.waiting_for_agent_response = False
-        #     self.agent.provide_response(text)
-        #     # Do not process as a new prompt
-        #     return
-        # elif self.waiting_for_agent_response:
-        #     # Agent is not running but waiting flag is set - reset it
-        #     self.waiting_for_agent_response = False
-        #     self.set_status_with_input("Ready")
-        #     # Fall through to treat as normal prompt
 
         # If this is a command that requires arguments but none provided, keep input open
         if text.startswith("/"):
@@ -322,6 +301,22 @@ class MainApp(App):
                 else:
                     conversation.write(f"Invalid mode: {new_mode}. Valid modes: auto, permission")
             self.set_status_with_input("Ready")
+        elif cmd == "theme":
+            if len(parts) == 1:
+                # Show current theme and available presets
+                current = get_theme()
+                presets = list_presets()
+                conversation.write(f"Current theme: [bold]{current['name']}[/bold]")
+                conversation.write(f"Available presets: {', '.join(presets)}")
+                conversation.write("Use /theme <name> to switch. Create config/theme.json for custom themes.")
+            else:
+                theme_name = parts[1].lower()
+                if load_theme(theme_name):
+                    conversation.write(f"Theme changed to: [bold]{theme_name}[/bold]")
+                    self.refresh()
+                else:
+                    conversation.write(f"Theme '{theme_name}' not found. Available: {', '.join(list_presets())}")
+            self.set_status_with_input("Ready")
         elif cmd == "quit":
             self.exit()
         elif cmd == "set_workspace":
@@ -377,6 +372,9 @@ class MainApp(App):
             else:
                 self.set_status_with_input("Fetching Chats...")
                 self.agent.fetch_chats_in_thread(self._on_fetch_chats_complete)
+        elif cmd == "export":
+            self._export_conversation(conversation)
+            self.set_status_with_input("Ready")
         else:
             conversation.write(f"Unknown command: {command}")
             self.set_status_with_input("Ready")
@@ -581,12 +579,25 @@ class MainApp(App):
 
     def _on_permission_request(self, data: dict) -> None:
         """Called when agent requests permission for a tool."""
+        import json
         tool = data.get('tool', 'unknown')
         args = data.get('args', {})
         conversation = self.query_one("#conversation")
-        conversation.write(f"[yellow]Permission required: Tool '{tool}' with arguments: {args}[/yellow]")
-        conversation.write("Use arrow keys to select an option and press Enter.")
+
+        # Build detailed permission request message
+        args_summary = json.dumps(args, indent=2) if args else "{}"
+        conversation.write(
+            f"[yellow bold]\U0001F510 Permission Required[/yellow bold]\n"
+            f"[yellow]Tool:[/yellow] [bold]{tool}[/bold]\n"
+            f"[yellow]Arguments:[/yellow]\n[dim]{args_summary}[/dim]"
+        )
+        conversation.write(
+            "[dim]Press [bold]y[/bold] (allow once), [bold]s[/bold] (allow session), "
+            "[bold]n[/bold] (reject), or use arrow keys + Enter[/dim]"
+        )
         self.waiting_for_permission_response = True
+        # Set tool info on the selector
+        self.permission_selector.set_tool_info(tool, args)
         # Show the permission selector and give it focus
         self.permission_selector.display = True
         self.permission_selector.focus()
@@ -608,6 +619,36 @@ class MainApp(App):
         # Send decision to agent
         self.agent.provide_permission_response(decision)
         self.call_after_refresh(self._scroll_to_bottom)
+
+    def _export_conversation(self, conversation) -> None:
+        """Export the current conversation to a Markdown file."""
+        import datetime
+        children = conversation.children
+        lines = [
+            "# DeepSeekCli Conversation Export",
+            f"Exported: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+        ]
+        for child in children:
+            try:
+                renderable = child.render()
+                text = str(renderable) if renderable else ""
+            except Exception:
+                text = str(child)
+            if text.strip():
+                lines.append(text)
+                lines.append("")
+
+        export_path = os.path.join(
+            self.state.workspace,
+            f"conversation_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        )
+        try:
+            with open(export_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            conversation.write(f"Conversation exported to: [bold]{export_path}[/bold]")
+        except OSError as e:
+            conversation.write(f"[red]Failed to export: {e}[/red]")
 
     def _scroll_to_bottom(self) -> None:
         """Scroll the scrollable area to the bottom."""

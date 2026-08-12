@@ -1,0 +1,28 @@
+{
+  "_name": "custom",
+  "_comment": "Copy this file and modify values to create your own theme. Delete this file to use a built-in preset via /theme <name>.",
+  "ACCENT": "#C792EA",
+  "ACCENT_RGB": "rgb(199,146,234)",
+  "BG_MAIN": "#000000",
+  "BG_WIDGET": "#1A1A1A",
+  "BG_INPUT": "#292929",
+  "TEXT_PRIMARY": "#FFFFFF",
+  "TEXT_SECONDARY": "#A0A0A0",
+  "TEXT_MUTED": "#DCDCDC",
+  "BORDER_LIGHT": "rgba(255,255,255,0.08)",
+  "BORDER_MEDIUM": "rgba(255,255,255,0.2)",
+  "TEXT_PRIMARY_RGB": "rgb(255,255,255)",
+  "TEXT_MUTED_RGB": "rgb(220,220,220)",
+  "SUCCESS": "#00FF00",
+  "ERROR": "#FF0000",
+  "WARNING": "#FFFF00",
+  "LOGO_GRADIENT": [
+    "rgb(110,168,254)",
+    "rgb(125,159,254)",
+    "rgb(139,124,255)",
+    "rgb(159,124,255)",
+    "rgb(178,108,255)",
+    "rgb(189,115,255)",
+    "rgb(200,122,255)"
+  ]
+}
