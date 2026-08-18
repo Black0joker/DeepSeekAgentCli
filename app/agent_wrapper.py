@@ -4,7 +4,7 @@ import threading
 import uuid
 from typing import Callable, Dict, Any, Optional
 
-AgentSystemMd = os.path.join(os.path.dirname(__file__), "agent", "system.md")
+AgentSystemMd = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "system.md"))
 
 # Import agent modules
 from app.agent.module import DeepSeekClient, execute_tool, create_client, load_system_prompt, set_working_directory

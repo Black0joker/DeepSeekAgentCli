@@ -1,0 +1,9 @@
+# Runtime dependencies
+python-dotenv>=1.0.0
+requests>=2.31.0
+rich>=13.7.0
+textual>=0.86.0
+wasmtime>=23.0.0
+
+# Optional dev/test
+pytest>=7.4.0

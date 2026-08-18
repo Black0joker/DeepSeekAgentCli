@@ -8,7 +8,7 @@ A **terminal-based UI (TUI) client** for the DeepSeek chat API, built with the [
 
 ```bash
 # Install dependencies
-pip install -r app/agent/requirements.txt
+pip install -r requirements.txt
 
 # Create .env file with your DeepSeek credentials
 echo DS_SMIDV2=your_value >> app/agent/.env
@@ -81,6 +81,8 @@ python main.py
 DeepSeekCli/
 ├── main.py                  # Entry point
 ├── removeChats.py           # Utility to bulk-delete chat sessions
+├── requirements.txt         # Python dependencies
+├── system.md                # System prompt for the autonomous agent
 ├── project.md               # Project documentation
 ├── app/
 │   ├── app.py               # Main Textual App (UI layout, CSS, event handling)
@@ -97,8 +99,6 @@ DeepSeekCli/
 │   │   ├── config.py        # Environment configuration (.env loading)
 │   │   ├── logger.py        # Colored logging utility
 │   │   ├── algorithmFunction.py  # PoW (Proof of Work) WASM solver
-│   │   ├── system.md        # System prompt for the autonomous agent
-│   │   └── requirements.txt # Python dependencies
 │   └── widgets/
 │       ├── conversation.py  # Chat message display (Rich Text support)
 │       ├── input_box.py     # User input field with key handling
