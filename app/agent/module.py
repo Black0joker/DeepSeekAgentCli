@@ -15,7 +15,7 @@ import glob as glob_module
 import threading
 from pathlib import Path
 from app.agent.algorithmFunction import compute_pow_answer
-from app.agent.edit_file import edit_file as advanced_edit_file, replace_code
+from app.agent.edit_file import  edit_file
 
 
 # Global working directory that can be updated dynamically
@@ -226,6 +226,7 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
                     BACKGROUND_PROCESSES[proc_id]["returncode"] = returncode
 
     except Exception as ex:
+        Logger.exception(f"Background process {proc_id} failed: {ex}")
         if timeout_timer:
             timeout_timer.cancel()
         with _state_lock:
@@ -1197,11 +1198,10 @@ def execute_tool(name: str, arguments: dict):
         
             
         elif name=="replace":
-            edit_result = replace_code(
+            edit_result = edit_file(
                 file_path=os.path.join(CURRENT_PATH, arguments['path']),
                 search=arguments['search'],
                 replace=arguments['replace'],
-                operation="replace"
             )
             if edit_result.success:
                 result_data = {

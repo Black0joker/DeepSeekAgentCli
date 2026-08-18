@@ -1,6 +1,8 @@
 """Footer with session metadata: workspace, mode, thinking, git branch, theme."""
 from textual.widgets import Static
 
+from app.agent.logger import Logger
+
 
 class CustomFooter(Static):
     """Footer with metadata."""
@@ -22,8 +24,8 @@ class CustomFooter(Static):
             )
             if result.returncode == 0:
                 return result.stdout.strip()
-        except Exception:
-            pass
+        except Exception as e:
+            Logger.debug(f"Git branch detection failed in {workspace}: {e}")
         return None
 
     def render(self) -> str:

@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from app.agent.logger import Logger
+
 
 # ── Private state ──────────────────────────────────────────────────────────
 
@@ -224,8 +226,8 @@ def load_theme(theme_name: Optional[str] = None, config_path: Optional[str] = No
             with open(path, "r", encoding="utf-8") as f:
                 overrides = json.load(f)
             _current_theme_name = overrides.pop("_name", path.stem)
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            Logger.warn(f"Failed to load theme config from {path}: {e}")
 
     # Try preset if no file overrides
     if not overrides and theme_name and theme_name in PRESETS:

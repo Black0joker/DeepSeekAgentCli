@@ -209,7 +209,8 @@ class AgentWrapper:
                         call_id = str(uuid.uuid4())[:8]
 
                         self._call_callback('on_tool', {'tool': tool, 'arguments': args, 'call_id': call_id})
-                        
+                        Logger.tool(tool, args)
+
                         # Check mode and permission
                         mode = self.app.state.mode if hasattr(self.app, 'state') else "permission"
                         read_only_tools = ['read_file', 'list_directory', 'current_path', 'search_file', 'glob', 'grep_search', 'list_background_processes', 'read_background_output', 'enter_plan_mode']
@@ -223,6 +224,7 @@ class AgentWrapper:
                                 if decision == "reject":
                                     reject_result = {"status": "error", "tool": tool, "result": {"error_msg": "Tool execution rejected by user."}}
                                     results.append(reject_result)
+                                    Logger.tool_result(tool, reject_result)
                                     self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': reject_result, 'call_id': call_id})
                                     prompt = f"Tool output:\n{json.dumps(results)}"
                                     continue
@@ -236,6 +238,7 @@ class AgentWrapper:
                             set_working_directory(workspace)
                         result = execute_tool(tool, args)
                         results.append(result)
+                        Logger.tool_result(tool, result)
 
                         # Notify UI of the tool result (paired with on_tool via call_id)
                         self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': result, 'call_id': call_id})
