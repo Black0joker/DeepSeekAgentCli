@@ -32,11 +32,7 @@ Layer 7 - FUZZY CANDIDATE DISCOVERY (candidates only, NEVER auto-edits)
 
 Operations Supported:
 =====================
-- replace:  Replace matched text with new content
-- insert:   Insert content before/after a matched anchor, or at a line number
-- delete:   Remove matched text
-- create:   Create a new file (fails if file already exists)
-- append:   Append content to the end of a file
+- replace:  Replace matched text with new content (ONLY supported operation)
 
 Safety Guarantees:
 ==================
@@ -203,7 +199,6 @@ class EditPlan:
     match: MatchResult
     original_content: str
     replacement_text: Optional[str] = None
-    insert_position: str = "after"
     # Computed after planning
     new_content: Optional[str] = None
     diff_preview: Optional[str] = None
@@ -442,6 +437,70 @@ def _find_exact_matches(content: str, search: str) -> List[int]:
         positions.append(idx)
         start = idx + 1
     return positions
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Line-Ending Normalized Match
+# ---------------------------------------------------------------------------
+def _find_line_ending_normalized_matches(
+    content: str, search: str
+) -> List[Tuple[int, int]]:
+    """
+    Find matches after normalizing line endings (\r\n and \r to \n).
+    Returns list of (start_offset, end_offset) in the original content.
+    This layer handles files with mixed or non-LF line endings where
+    the search text uses a different line ending style.
+    """
+    # Build a mapping from normalized offsets to original offsets
+    # Each \r\n in original becomes \n in normalized (loses 1 char)
+    # Each standalone \r becomes \n (no length change)
+    offset_map = []  # offset_map[normalized_pos] = original_pos
+    i = 0
+    content_len = len(content)
+    while i < content_len:
+        offset_map.append(i)
+        if content[i] == '\r':
+            if i + 1 < content_len and content[i + 1] == '\n':
+                i += 2  # \r\n -> \n (skip 2 chars in original, 1 in normalized)
+            else:
+                i += 1  # \r -> \n (skip 1 char)
+        else:
+            i += 1
+    offset_map.append(content_len)  # sentinel for end
+
+    # Normalize both content and search to LF
+    normalized_content = content.replace('\r\n', '\n').replace('\r', '\n')
+    normalized_search = search.replace('\r\n', '\n').replace('\r', '\n')
+
+    # If normalization didn't change anything, this layer adds nothing
+    if normalized_content == content and normalized_search == search:
+        return []
+
+    # Find exact matches in the normalized content
+    positions = []
+    start = 0
+    while True:
+        idx = normalized_content.find(normalized_search, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+
+    if not positions:
+        return []
+
+    # Map normalized offsets back to original offsets
+    matches = []
+    for norm_start in positions:
+        norm_end = norm_start + len(normalized_search)
+        if norm_start < len(offset_map) and norm_end < len(offset_map):
+            orig_start = offset_map[norm_start]
+            orig_end = offset_map[norm_end]
+            if orig_end > orig_start:
+                matches.append((orig_start, orig_end))
+
+    return matches
+
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +986,39 @@ def resolve_target(
                 suggested_action="read_file",
             )
 
+    # Layer 2: Line-ending normalized
+    le_matches = _find_line_ending_normalized_matches(content, search)
+    if le_matches:
+        if context_before or context_after:
+            le_matches = _filter_matches_by_context(
+                content, le_matches, context_before, context_after
+            )
+        if len(le_matches) == 1:
+            return MatchResult(
+                found=True,
+                start=le_matches[0][0],
+                end=le_matches[0][1],
+                strategy="line_ending_normalized",
+                confidence=0.98,
+                match_count=1,
+                safe=True,
+                evidence={"layer": 2, "method": "line_ending_normalization"},
+            )
+        elif len(le_matches) > 1:
+            candidates = _build_candidates(content, le_matches, "line_ending_normalized", 0.98)
+            return MatchResult(
+                found=False,
+                strategy="line_ending_normalized",
+                confidence=0.98,
+                match_count=len(le_matches),
+                safe=False,
+                candidates=candidates,
+                error="ambiguous_match",
+                message=f"Found {len(le_matches)} matches using line-ending-normalized strategy.",
+                hint="Provide context_before/context_after or more surrounding code to disambiguate.",
+                suggested_action="read_file",
+            )
+
     # Layer 3: Indentation-normalized
     indent_matches = _find_indentation_normalized_matches(content, search)
     if indent_matches:
@@ -1116,7 +1208,6 @@ def create_edit_plan(
     match: MatchResult,
     operation: str,
     replacement: Optional[str],
-    insert_position: str = "after",
 ) -> EditPlan:
     """Create an edit plan from a resolved match.
 
@@ -1129,7 +1220,6 @@ def create_edit_plan(
         match=match,
         original_content=content,
         replacement_text=replacement,
-        insert_position=insert_position,
     )
 
     if not match.found or match.start is None or match.end is None:
@@ -1153,15 +1243,7 @@ def create_edit_plan(
         plan.new_content = content[:start] + reindented + content[end:]
         plan.replacement_text = reindented
 
-    elif operation == 'delete':
-        plan.new_content = content[:start] + content[end:]
 
-    elif operation == 'insert':
-        insert_text = replacement or ""
-        if insert_position == 'before':
-            plan.new_content = content[:start] + insert_text + content[start:]
-        else:
-            plan.new_content = content[:end] + insert_text + content[end:]
 
     # Compute diff stats
     if plan.new_content is not None:
@@ -1279,8 +1361,6 @@ def edit_file(
     search: Optional[str] = None,
     replace: Optional[str] = None,
     operation: str = "replace",
-    insert_position: str = "after",
-    at_line: Optional[int] = None,
     context_before: Optional[str] = None,
     context_after: Optional[str] = None,
     symbol: Optional[str] = None,
@@ -1289,15 +1369,13 @@ def edit_file(
     validators: Optional[List[CodeValidator]] = None,
 ) -> EditResult:
     """
-    Perform an edit operation on a file.
+    Perform a replace edit operation on a file.
 
     Args:
         file_path:       Absolute or relative path to the file.
         search:          The text to search for in the file.
-        replace:         The replacement/insertion text.
-        operation:       One of 'replace', 'insert', 'delete', 'create', 'append'.
-        insert_position: For insert: 'before' or 'after' the match.
-        at_line:         For insert: 1-based line number to insert at.
+        replace:         The replacement text.
+        operation:       Must be 'replace' (only supported operation).
         context_before:  Optional context lines that should appear before the target.
         context_after:   Optional context lines that should appear after the target.
         symbol:          Optional symbol path (e.g., 'Class.method') to scope the search.
@@ -1308,21 +1386,17 @@ def edit_file(
     Returns:
         EditResult with structured success/failure information.
     """
-    valid_ops = ('replace', 'insert', 'delete', 'create', 'append')
+    valid_ops = ('replace',)
     if operation not in valid_ops:
         return EditResult(
             success=False,
             error="invalid_operation",
-            message=f"Unknown operation '{operation}'. Must be one of: {', '.join(valid_ops)}",
+            message=f"Unknown operation '{operation}'. Only 'replace' is supported.",
             suggested_action="check_documentation",
         )
 
-    # --- CREATE operation (no existing file needed) ---
-    if operation == 'create':
-        return _handle_create(file_path, replace, dry_run)
-
-    # --- Validate inputs for other operations ---
-    if not search and operation not in ('append',) and at_line is None:
+    # --- Validate inputs ---
+    if not search:
         return EditResult(
             success=False,
             error="empty_search",
@@ -1330,7 +1404,7 @@ def edit_file(
             suggested_action="provide_search_text",
         )
 
-    if operation == 'replace' and replace is None:
+    if replace is None:
         return EditResult(
             success=False,
             error="missing_replace",
@@ -1338,21 +1412,9 @@ def edit_file(
             suggested_action="provide_replace_text",
         )
 
-    if operation == 'insert' and replace is None:
-        return EditResult(
-            success=False,
-            error="missing_insert_content",
-            message="Content to insert is required for 'insert' operation.",
-            suggested_action="provide_insert_content",
-        )
 
-    if operation == 'append' and replace is None:
-        return EditResult(
-            success=False,
-            error="missing_append_content",
-            message="Content to append is required for 'append' operation.",
-            suggested_action="provide_append_content",
-        )
+
+
 
     # --- Read file ---
     try:
@@ -1407,16 +1469,6 @@ def edit_file(
     # Normalize content to LF for matching
     content_lf = _normalize_to_lf(content)
     search_lf = _normalize_to_lf(search) if search else None
-
-    # --- APPEND operation ---
-    if operation == 'append':
-        return _handle_append(path, content_lf, replace, line_ending, dry_run)
-
-    # --- INSERT at specific line ---
-    if operation == 'insert' and at_line is not None:
-        return _handle_insert_at_line(
-            path, content_lf, replace, at_line, line_ending, dry_run
-        )
 
     # --- Symbol-aware scoping (optional, Phase 3 extension point) ---
     if symbol:
@@ -1490,7 +1542,6 @@ def edit_file(
         match=match,
         operation=operation,
         replacement=replace,
-        insert_position=insert_position,
     )
 
     if not plan.is_valid:
@@ -1634,148 +1685,7 @@ def _resolve_symbol_scope(content: str, symbol: str) -> Optional[Tuple[int, int]
 # Operation handlers
 # ---------------------------------------------------------------------------
 
-def _handle_create(
-    file_path: str, content: Optional[str], dry_run: bool
-) -> EditResult:
-    """Create a new file. Fails if file already exists."""
-    if content is None:
-        return EditResult(
-            success=False,
-            error="missing_content",
-            message="Content is required for 'create' operation.",
-            suggested_action="provide_content",
-        )
 
-    path = Path(file_path)
-    if path.exists():
-        return EditResult(
-            success=False,
-            error="file_exists",
-            message=f"File already exists: {file_path}. "
-                    f"Use 'replace' or 'write_file' to modify existing files.",
-            hint="If you want to overwrite, use write_file instead.",
-            suggested_action="use_write_file",
-        )
-
-    if dry_run:
-        return EditResult(
-            success=True,
-            match_type="create",
-            confidence=1.0,
-            operations_applied=1,
-            edit_applied=False,
-            message=f"[DRY RUN] Would create file: {file_path} ({len(content)} chars)"
-        )
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(path, content)
-        return EditResult(
-            success=True,
-            match_type="create",
-            confidence=1.0,
-            operations_applied=1,
-            edit_applied=True,
-            message=f"Created file: {file_path} ({len(content)} chars)"
-        )
-    except PermissionError:
-        return EditResult(
-            success=False,
-            error="permission_denied",
-            message=f"Permission denied creating file: {file_path}",
-            suggested_action="check_permissions",
-        )
-    except OSError as e:
-        return EditResult(
-            success=False,
-            error="os_error",
-            message=f"OS error creating file: {e}",
-            suggested_action="check_file_system",
-        )
-
-
-def _handle_append(
-    path: Path, content: str, append_text: str, line_ending: str, dry_run: bool
-) -> EditResult:
-    """Append content to the end of a file."""
-    try:
-        if content and not content.endswith('\n'):
-            new_content = content + line_ending + _normalize_to_lf(append_text)
-        else:
-            new_content = content + _normalize_to_lf(append_text)
-
-        if line_ending != '\n':
-            new_content = new_content.replace('\n', line_ending)
-
-        total_lines = new_content.count('\n') + 1
-
-        if not dry_run:
-            _atomic_write(path, new_content)
-
-        return EditResult(
-            success=True,
-            match_type="append",
-            confidence=1.0,
-            operations_applied=1,
-            edit_applied=not dry_run,
-            message=f"{'[DRY RUN] ' if dry_run else ''}Appended content to {path.name}. "
-                    f"File now has ~{total_lines} lines."
-        )
-    except PermissionError:
-        return EditResult(
-            success=False,
-            error="permission_denied",
-            message=f"Permission denied writing file: {path}",
-            suggested_action="check_permissions",
-        )
-    except OSError as e:
-        return EditResult(
-            success=False,
-            error="os_error",
-            message=f"OS error writing file: {e}",
-            suggested_action="check_file_system",
-        )
-
-
-def _handle_insert_at_line(
-    path: Path, content: str, insert_text: str,
-    at_line: int, line_ending: str, dry_run: bool
-) -> EditResult:
-    """Insert content at a specific 1-based line number."""
-    lines = content.split('\n')
-    total_lines = len(lines)
-
-    if at_line < 1 or at_line > total_lines + 1:
-        return EditResult(
-            success=False,
-            error="invalid_line",
-            message=f"Line {at_line} is out of range. File has {total_lines} lines. "
-                    f"Valid range: 1-{total_lines + 1}.",
-            suggested_action="check_line_number",
-        )
-
-    insert_lines = _normalize_to_lf(insert_text).split('\n')
-    insert_idx = at_line - 1
-    new_lines = lines[:insert_idx] + insert_lines + lines[insert_idx:]
-    new_content = '\n'.join(new_lines)
-
-    if line_ending != '\n':
-        new_content = new_content.replace('\n', line_ending)
-
-    if not dry_run:
-        _atomic_write(path, new_content)
-
-    return EditResult(
-        success=True,
-        match_type="line_insert",
-        confidence=1.0,
-        operations_applied=1,
-        edit_applied=not dry_run,
-        start_line=at_line,
-        end_line=at_line + len(insert_lines) - 1,
-        message=f"{'[DRY RUN] ' if dry_run else ''}Inserted {len(insert_lines)} line(s) "
-                f"at line {at_line}."
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 from html.parser import HTMLParser
+import itertools
 import sys
 from typing import Any, Dict, Generator
 import subprocess
@@ -14,7 +15,7 @@ import glob as glob_module
 import threading
 from pathlib import Path
 from app.agent.algorithmFunction import compute_pow_answer
-from app.agent.edit_file import edit_file as advanced_edit_file
+from app.agent.edit_file import edit_file as advanced_edit_file, replace_code
 
 
 # Global working directory that can be updated dynamically
@@ -25,6 +26,10 @@ if getattr(sys, 'frozen', False):
 else:
     _BASE = Path(__file__).parent.parent.parent
 
+# Path to the CA certificate used for request interception
+# _CERT_PATH = str(_BASE / "cert.pem")
+_CERT_PATH = None
+
 # Background process tracking
 BACKGROUND_PROCESSES = {}
 PLAN_MODE_ENABLED = False
@@ -33,6 +38,8 @@ _plan_mode_lock = threading.Lock()
 # Cached workspace path to avoid repeated os.path.abspath calls
 _CACHED_WORKSPACE_PATH = None
 
+def json_size_kb(results):
+    return len(json.dumps(results).encode('utf-8')) / 1024
 
 class _DDGParser(HTMLParser):
     """Reusable DuckDuckGo HTML parser. Defined at module level to avoid
@@ -94,6 +101,8 @@ def _which_cached(cmd):
         return _WHICH_CACHE[cmd]
 
 
+
+
 def _resolve_cwd(cwd: str) -> str:
     """Resolve a cwd argument to an absolute path relative to CURRENT_PATH."""
     if os.path.isabs(cwd):
@@ -141,9 +150,23 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
     Uses subprocess.Popen to read output incrementally as it is produced,
     updating the shared output buffer so that read_background_output can
     return partial results while the process is still running.
+
+    A separate watchdog timer ensures the process is killed even if it
+    produces no output (fixes the per-line-only timeout check bug).
+
     The thread releases all resources (process handles, pipes) upon completion.
     """
     proc = None
+    timed_out = False
+    timeout_timer = None
+
+    def _timeout_watchdog():
+        """Watchdog callback: kill the process if still running after timeout."""
+        nonlocal timed_out
+        if proc is not None and proc.poll() is None:
+            timed_out = True
+            proc.kill()
+
     try:
         # Use Popen for streaming output (merge stderr into stdout)
         if _which_cached(first_cmd):
@@ -170,7 +193,12 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
 
         # Stream output line by line into the shared buffer
         output_lines = []
-        start_time = time.time()
+
+        # Set up a watchdog timer to kill the process even if it produces no output
+        if timeout:
+            timeout_timer = threading.Timer(timeout, _timeout_watchdog)
+            timeout_timer.daemon = True
+            timeout_timer.start()
 
         for line in proc.stdout:
             output_lines.append(line)
@@ -178,15 +206,10 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
             with _state_lock:
                 if proc_id in BACKGROUND_PROCESSES:
                     BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
-            # Check timeout
-            if timeout and (time.time() - start_time) > timeout:
-                proc.kill()
-                proc.wait()
-                with _state_lock:
-                    if proc_id in BACKGROUND_PROCESSES:
-                        BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines) + f"\nProcess timed out after {timeout}s"
-                        BACKGROUND_PROCESSES[proc_id]["status"] = "timeout"
-                return
+
+        # Cancel the watchdog timer if the process finished naturally
+        if timeout_timer:
+            timeout_timer.cancel()
 
         # Wait for process to fully exit and get return code
         proc.wait()
@@ -194,17 +217,25 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
 
         with _state_lock:
             if proc_id in BACKGROUND_PROCESSES:
-                BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
-                BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
-                BACKGROUND_PROCESSES[proc_id]["returncode"] = returncode
+                if timed_out:
+                    BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines) + f"\nProcess timed out after {timeout}s"
+                    BACKGROUND_PROCESSES[proc_id]["status"] = "timeout"
+                else:
+                    BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
+                    BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
+                    BACKGROUND_PROCESSES[proc_id]["returncode"] = returncode
 
     except Exception as ex:
+        if timeout_timer:
+            timeout_timer.cancel()
         with _state_lock:
             if proc_id in BACKGROUND_PROCESSES:
                 BACKGROUND_PROCESSES[proc_id]["output"] = str(ex)
                 BACKGROUND_PROCESSES[proc_id]["status"] = "failed"
     finally:
-        # Release process resources (close pipes, ensure process is dead)
+        # Cancel watchdog timer and release process resources
+        if timeout_timer:
+            timeout_timer.cancel()
         if proc is not None:
             try:
                 if proc.stdout:
@@ -214,7 +245,6 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
                     proc.wait(timeout=5)
             except Exception:
                 pass
-
 
 def _handle_shell_command(arguments: dict):
     """Handle the run_shell_command tool with full validation."""
@@ -316,6 +346,60 @@ def _handle_shell_command(arguments: dict):
                 "stderr": stderr,
                 "returncode": -1,
             }
+        }
+
+
+def _handle_code_interpreter(arguments: dict) -> dict:
+    """Handle the code_interpreter tool: execute Python code via python -c."""
+    code = arguments.get('code')
+    if not code:
+        return {
+            "status": "error",
+            "tool": "code_interpreter",
+            "result": {"error_msg": "Missing 'code' argument"}
+        }
+
+    timeout = arguments.get('timeout', 60)
+    try:
+        timeout = int(timeout)
+    except (ValueError, TypeError):
+        timeout = 60
+
+    try:
+        result = subprocess.run(
+            ["python", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=CURRENT_PATH,
+        )
+        return {
+            "status": "success",
+            "tool": "code_interpreter",
+            "result": {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+            }
+        }
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode() if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or '')
+        stderr = e.stderr.decode() if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or '')
+        return {
+            "status": "success",
+            "tool": "code_interpreter",
+            "result": {
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": -1,
+            }
+        }
+    except Exception as e:
+        Logger.error(f"Tool 'code_interpreter' failed: {e}")
+        return {
+            "status": "error",
+            "tool": "code_interpreter",
+            "result": {"error_msg": str(e)}
         }
 
 
@@ -516,376 +600,8 @@ def get_working_directory():
     """Get the current working directory for tool operations."""
     return CURRENT_PATH
 
-class DeepSeekClient:
-    """Client for interacting with the DeepSeek chat API."""
-    def __init__(self, cookies, headers):
-        self.session = requests.Session()
-
-        self.session.cookies.update(cookies)
-        self.session.headers.update(headers)
-        self.base_url = "https://chat.deepseek.com/api/v0"
-        self.gator_url = "https://gator.volces.com/list"
-        self.session_id = str(uuid.uuid4())
-        self.web_id = "7642988951426344972" # Should be dynamic in production
-        self.user_unique_id = str(uuid.uuid4())
-
-    def _report_telemetry(self, event, params):
-        """Reports telemetry events to the Volcano Engine logger."""
-        payload = [{
-            "events": [{
-                "event": event,
-                "params": json.dumps(params),
-                "local_time_ms": int(time.time() * 1000),
-                "is_bav": 0,
-                "session_id": self.session_id
-            }],
-            "user": {
-                "user_unique_id": self.user_unique_id,
-                "web_id": self.web_id
-            },
-            "header": {
-                "app_id": 20006317,
-                "os_name": "windows",
-                "platform": "web",
-                "browser": "Chrome",
-                "browser_version": "149.0.0.0"
-            },
-            "local_time": int(time.time()),
-            "verbose": 1
-        }]
-        # Reporting telemetry usually doesn't raise error on failure in production
-        try:
-            self.session.post(self.gator_url, json=payload)
-        except Exception as e:
-            Logger.error(f"Telemetry reporting failed: {e}")
-
-    def _request(self, method, url, **kwargs):
-        """Centralized request method with standard error handling."""
-        try:
-            response = self.session.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as e:
-            Logger.error(f"API request failed: {e}")
-            raise
-
-    def create_chat(self):
-        """Creates a new chat session."""
-        Logger.info("Creating new chat session...")
-        response = self._request("POST", f"{self.base_url}/chat_session/create", json={})
-        session_id = response.json()["data"]['biz_data']['chat_session']["id"]
-        Logger.success(f"Chat session created: {session_id}")
-        return session_id
-
-    def fetch_chats(self):
-        """Fetches a list of chat sessions."""
-        Logger.info("Fetching chat sessions...")
-        response = self._request(
-            "GET",
-            f"{self.base_url}/chat_session/fetch_page",
-            params={"lte_cursor.pinned": "false"}
-        )
-        chats = response.json()["data"]["biz_data"]["chat_sessions"]
-        Logger.success(f"Fetched {len(chats)} chat sessions.")
-        return chats
-
-    def get_chat_history(self, chat_session_id):
-        """Gets the history messages for a given chat session."""
-        Logger.info(f"Fetching chat history for session: {chat_session_id}")
-        response = self._request(
-            "GET",
-            f"{self.base_url}/chat/history_messages",
-            params={"chat_session_id": chat_session_id}
-        )
-        history = response.json()["data"]["biz_data"]
-        Logger.success(f"Fetched history for session: {chat_session_id}")
-        return history
-    
-    def get_last_message_id(self, chat_session_id):
-        """Gets the history messages for a given chat session."""
-        Logger.info(f"Fetching chat history for session: {chat_session_id}")
-        response = self._request(
-            "GET",
-            f"{self.base_url}/chat/history_messages",
-            params={"chat_session_id": chat_session_id}
-        )
-        messageId = response.json()["data"]["biz_data"]['chat_session']['current_message_id']
-        Logger.success(f"Fetched history for session: {chat_session_id}")
-        return int(messageId)
 
 
-    def _solve_pow(self, target_path, scene):
-        """Acquires, solves, and reports telemetry for the PoW challenge."""
-        
-        # 1. Request challenge
-        response = self._request(
-            "POST",
-            f"{self.base_url}/chat/create_pow_challenge",
-            json={"target_path": target_path}
-        )
-        challenge_data = response.json()["data"]["biz_data"]["challenge"]
-        
-        # 2. Report Start Telemetry
-        self._report_telemetry("preparePowChallengeAndSolve", {"ds_scene": scene})
-        self._report_telemetry("powSolveChallengeStart", {"ds_scene": scene})
-        
-        # 3. Solve
-        start_time = time.time()
-        wasm_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sha3_wasm_bg.7b9ca65ddd.wasm')
-        if not os.path.exists(wasm_file):
-            raise FileNotFoundError(f"Required WASM file not found: {wasm_file}")
-            
-        answer = compute_pow_answer(
-            algorithm=challenge_data["algorithm"],
-            challenge_str=challenge_data["challenge"],
-            salt=challenge_data["salt"],
-            difficulty=challenge_data["difficulty"],
-            expire_at=challenge_data["expire_at"],
-            signature=challenge_data["signature"],
-            target_path=challenge_data["target_path"],
-            wasm_path=wasm_file
-        )
-        duration = (time.time() - start_time) * 1000
-        
-        # 4. Report Success Telemetry
-        self._report_telemetry("powSolveChallengeSuccess", {"ds_scene": scene, "ds_duration": duration})
-        self._report_telemetry("powPrepared", {"ds_scene": scene, "ds_answer": answer, "ds_duration": duration})
-        
-        challenge_data["answer"] = answer
-        
-        # 5. Prepare payload
-        payload = {
-            "algorithm": challenge_data["algorithm"],
-            "challenge": challenge_data["challenge"],
-            "salt": challenge_data["salt"],
-            "answer": challenge_data["answer"],
-            "signature": challenge_data["signature"],
-            "target_path": challenge_data['target_path'],
-        }
-        
-        json_str = json.dumps(payload, separators=(",", ":"))
-        return base64.b64encode(json_str.encode()).decode()
-
-    def send_prompt(self, prompt, chat_session_id, parent_message_id=None,thinking_mode=True):
-        """Sends a prompt to the specified chat session."""
-        target_path = "/api/v0/chat/completion"
-        pow_token = self._solve_pow(target_path, "completion_like")
-
-        headers = self.session.headers.copy()
-        headers["x-ds-pow-response"] = pow_token
-
-        json_data = {
-            'chat_session_id': chat_session_id,
-            'parent_message_id': parent_message_id,
-            'model_type': 'expert',
-            'prompt': prompt,
-            'ref_file_ids': [],
-            'thinking_enabled': thinking_mode,
-            'search_enabled': False,
-            'action': None,
-            'preempt': False,
-        }
-
-        response = self._request(
-            "POST",
-            f"{self.base_url}/chat/completion",
-            headers=headers,
-            json=json_data,
-            stream=True
-        )
-        return response
-
-
-def full_parse_sse(response) -> Generator[Dict[str, Any], None, None]:
-    """
-    Parse SSE stream from DeepSeek API response.
-    Accumulates the full RESPONSE content, then parses it as JSON.
-
-    Supports both protocols:
-    - normal: conversation_mode exists in initial response
-    - thinking: no conversation_mode
-
-    Yields:
-    - {"type": "message_id", "value": int}
-    - {"type": "status", "value": str}
-    - {"type": "action", "value": dict}
-    """
-    message_sent = False
-    protocol = None          # "normal" | "thinking"
-    collecting = False
-    content = ""
-
-    for line in response.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-
-        try:
-            obj = json.loads(line[6:])
-        except json.JSONDecodeError:
-            continue
-
-        # ------------------------------------------------------
-        # Initial response: detect protocol and get message_id
-        # ------------------------------------------------------
-        if (
-            not message_sent
-            and isinstance(obj.get("v"), dict)
-            and "response" in obj["v"]
-        ):
-            response_obj = obj["v"]["response"]
-            protocol = (
-                "normal"
-                if "conversation_mode" in response_obj
-                else "thinking"
-            )
-            message_id = response_obj.get("message_id")
-            if message_id is not None:
-                message_sent = True
-                yield {
-                    "type": "message_id",
-                    "value": message_id,
-                }
-            # Normal protocol may already contain a RESPONSE fragment.
-            if protocol == "normal":
-                fragments = response_obj.get("fragments", [])
-                if fragments:
-                    last = fragments[-1]
-                    if last.get("type") == "RESPONSE":
-                        collecting = True
-                        content = last.get("content", "")
-            continue
-
-        # ------------------------------------------------------
-        # Check for stream end
-        # ------------------------------------------------------
-        if (
-            obj.get("p") == "response/status"
-            and obj.get("o") == "SET"
-            and obj.get("v") == "FINISHED"
-        ):
-            break
-
-        # ------------------------------------------------------
-        # NORMAL PROTOCOL: accumulate RESPONSE content
-        # ------------------------------------------------------
-        if protocol == "normal":
-            if (
-                obj.get("p") == "response/fragments"
-                and obj.get("o") == "APPEND"
-            ):
-                fragments = obj.get("v", [])
-                if fragments and fragments[0].get("type") == "RESPONSE":
-                    collecting = True
-                    content = fragments[0].get("content", "")
-            elif collecting:
-                path = obj.get("p")
-                if path == "response/fragments/-1/content":
-                    content += obj.get("v", "")
-                elif path is None and isinstance(obj.get("v"), str):
-                    content += obj["v"]
-                # Other paths (elapsed_secs, BATCH, etc.) are ignored
-
-        # ------------------------------------------------------
-        # THINKING PROTOCOL: accumulate content
-        # ------------------------------------------------------
-        else:
-            path = obj.get("p")
-            if path == "response/thinking_content":
-                collecting = False
-                continue
-            if path == "response/content":
-                collecting = True
-            elif path is not None:
-                collecting = False
-            if not collecting:
-                continue
-            value = obj.get("v")
-            if not isinstance(value, str):
-                continue
-            content += value
-
-    # ----------------------------------------------------------
-    # Parse the accumulated content
-    # ----------------------------------------------------------
-    if not content:
-        return
-
-    # Strip markdown code fences (```json ... ```)
-    text = content.strip()
-    if text.startswith("```"):
-        newline_idx = text.find("\n")
-        if newline_idx != -1:
-            text = text[newline_idx + 1:]
-        if text.rstrip().endswith("```"):
-            text = text.rstrip()[:-3].rstrip()
-
-    # Parse JSON
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: extract the first complete JSON object
-        start = text.find("{")
-        if start == -1:
-            return
-        depth = 0
-        in_str = False
-        esc = False
-        end = -1
-        for i in range(start, len(text)):
-            ch = text[i]
-            if esc:
-                esc = False
-                continue
-            if ch == "\\" and in_str:
-                esc = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        if end == -1:
-            return
-        try:
-            data = json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            return
-
-    # Yield status
-    status = data.get("status")
-    if status:
-        yield {"type": "status", "value": status}
-
-    # Yield all actions from the array
-    actions_list = data.get("actions", [])
-    if isinstance(actions_list, list):
-        for action in actions_list:
-            if isinstance(action, dict):
-                yield {"type": "action", "value": action}
-
-
-def load_system_prompt(path: str = "sys.md") -> str:
-    """Loads the system prompt from the specified file."""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def create_client() -> DeepSeekClient:
-    """Creates and configures a DeepSeekClient using validated configuration."""
-    Config.load()
-    return DeepSeekClient(Config.get_cookies(), Config.get_headers())
-
-
-# ---------------------------------------------------------------------------
-# Tool execution
-# ---------------------------------------------------------------------------
 EXPECTED_TOOLS=[
   {
     "tool": "current_path",
@@ -913,10 +629,12 @@ EXPECTED_TOOLS=[
     }
   },
   {
-    "tool": "read_file",
-    "arguments": {
-      "path": "string"
-    }
+      "tool": "read_file",
+      "arguments": {
+          "path": "string",
+          "start_line": "integer (optional)",
+          "end_line": "integer (optional)"
+      }
   },
   {
     "tool": "replace",
@@ -934,12 +652,18 @@ EXPECTED_TOOLS=[
     }
   },
   {
-    "tool": "run_shell_command",
-    "arguments": {
-      "command": "string",
-      "cwd": "string (optional)",
-      "timeout": "integer (optional)"
-    }
+  "tool": "run_shell_command",
+  "arguments": {
+  "command": "string",
+  "cwd": "string (optional)",
+  "timeout": "integer (optional)"
+  }
+  },
+  {
+  "tool": "code_interpreter",
+  "arguments": {
+  "code": "string"
+  }
   },
   {
     "tool": "list_background_processes",
@@ -999,17 +723,17 @@ EXPECTED_TOOLS=[
 def execute_tool(name: str, arguments: dict):
     """Executes a tool by name with the provided arguments."""
     # Security: Validate file paths to prevent path traversal
-    if name in ('read_file', 'write_file', 'replace', 'list_directory', 'run_shell_command'):
+    if name in ('read_file', 'write_file', 'replace', 'list_directory', 'run_shell_command', 'glob', 'grep_search'):
         if 'path' in arguments or 'cwd' in arguments:
             # Use cached workspace path to avoid repeated os.path.abspath
-            workspace_path = CURRENT_PATH
-            
+            workspace_path = _get_workspace_path()
+
             # Determine the target path to validate
             if name == 'run_shell_command':
                 target_cwd = arguments.get('cwd', '.')
                 target_path = os.path.abspath(os.path.join(CURRENT_PATH, target_cwd))
             else:
-                target_path = os.path.abspath(os.path.join(CURRENT_PATH, arguments['path']))
+                target_path = os.path.abspath(os.path.join(CURRENT_PATH, arguments.get('path', '.')))
             
             # Fast prefix check before expensive commonpath call
             # Normalize both paths with trailing separator for accurate prefix matching
@@ -1044,9 +768,11 @@ def execute_tool(name: str, arguments: dict):
                     }
     
     try:
-        if name == "run_shell_command":
+        if name == "code_interpreter":
+            return _handle_code_interpreter(arguments)
+        elif name == "run_shell_command":
             return _handle_shell_command(arguments)
-            
+                
         elif name=="current_path":
             return {
                     "status": "success",
@@ -1222,7 +948,7 @@ def execute_tool(name: str, arguments: dict):
                 query = arguments['query']
                 # Use DuckDuckGo HTML search as fallback (no API key needed)
                 search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-                resp = requests.get(search_url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+                resp = requests.get(search_url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'}, verify=_CERT_PATH)
                 results = []
                 # Simple parsing of DDG HTML results - parser class defined at module level for reuse
                 parser = _DDGParser()
@@ -1247,7 +973,7 @@ def execute_tool(name: str, arguments: dict):
 
         elif name=="web_fetch":
             try:
-                resp = requests.get(arguments['url'], timeout=30)
+                resp = requests.get(arguments['url'], timeout=30, verify=_CERT_PATH)
                 return {
                     "status": "success",
                     "tool": "web_fetch",
@@ -1305,51 +1031,173 @@ def execute_tool(name: str, arguments: dict):
         elif name == "read_file":
             try:
                 file_path = os.path.join(CURRENT_PATH, arguments['path'])
+                # Validate line range arguments
+                start_line = arguments.get('start_line')
+                end_line = arguments.get('end_line')
+                if start_line is not None:
+                    try:
+                        start_line = int(start_line)
+                    except (ValueError, TypeError):
+                        return {
+                            "status": "error",
+                            "tool": "read_file",
+                            "error": {
+                                "code": "INVALID_LINE_RANGE",
+                                "message": f"start_line must be an integer, got: {start_line!r}"
+                            }
+                        }
+                    if start_line < 1:
+                        return {
+                            "status": "error",
+                            "tool": "read_file",
+                            "error": {
+                                "code": "INVALID_LINE_RANGE",
+                                "message": "start_line must be >= 1."
+                            }
+                        }
+                if end_line is not None:
+                    try:
+                        end_line = int(end_line)
+                    except (ValueError, TypeError):
+                        return {
+                            "status": "error",
+                            "tool": "read_file",
+                            "error": {
+                                "code": "INVALID_LINE_RANGE",
+                                "message": f"end_line must be an integer, got: {end_line!r}"
+                            }
+                        }
+                    if end_line < 1:
+                        return {
+                            "status": "error",
+                            "tool": "read_file",
+                            "error": {
+                                "code": "INVALID_LINE_RANGE",
+                                "message": "end_line must be >= 1."
+                            }
+                        }
+                if start_line is not None and end_line is not None and end_line < start_line:
+                    return {
+                        "status": "error",
+                        "tool": "read_file",
+                        "error": {
+                            "code": "INVALID_LINE_RANGE",
+                            "message": "start_line must be less than or equal to end_line."
+                        }
+                    }
+                # Count total lines with chunked reads (memory-safe) instead of
+                # loading the entire file via readlines(). Text mode with universal
+                # newlines keeps line semantics identical to readlines() and
+                # surfaces UnicodeDecodeError the same way.
+                _COUNT_CHUNK = 65536
+                newline_count = 0
+                last_char = ''
                 with open(file_path, encoding="utf-8") as f:
-                    content = f.read()
+                    while True:
+                        chunk = f.read(_COUNT_CHUNK)
+                        if not chunk:
+                            break
+                        newline_count += chunk.count('\n')
+                        last_char = chunk[-1]
+                total_lines = newline_count + (1 if last_char and last_char != '\n' else 0)
+                # Determine effective range
+                if start_line is None:
+                    start_line = 1
+                range_end = min(end_line, total_lines) if end_line is not None else total_lines
+                # Clamp start_line to file bounds
+                if start_line > total_lines:
+                    # Requested range is beyond EOF - return empty content
+                    return {
+                        "status": "success",
+                        "tool": "read_file",
+                        "result": {
+                            "path": arguments['path'],
+                            "content": "",
+                            "start_line": start_line,
+                            "end_line": start_line,
+                            "total_lines": total_lines,
+                            "truncated": False
+                        }
+                    }
+                # Stream only the requested lines and stop accumulating once the
+                # serialized result would exceed the 20 KB cap. This avoids holding
+                # the whole file in memory and removes the repeated json.dumps
+                # re-serialization halving loop entirely (single pass instead).
+                MAX_RESULT_SIZE_KB = 20
+                max_bytes = MAX_RESULT_SIZE_KB * 1024
+                # Fixed envelope overhead (result object with empty content)
+                base_bytes = len(json.dumps({
+                    "status": "success",
+                    "tool": "read_file",
+                    "result": {
+                        "path": arguments['path'],
+                        "content": "",
+                        "start_line": start_line,
+                        "end_line": range_end,
+                        "total_lines": total_lines,
+                        "truncated": False
+                    }
+                }).encode('utf-8'))
+                selected_lines = []
+                used_bytes = base_bytes
+                with open(file_path, encoding="utf-8") as f:
+                    for line in itertools.islice(f, start_line - 1, range_end):
+                        line_bytes = len(json.dumps(line).encode('utf-8'))
+                        if selected_lines and used_bytes + line_bytes > max_bytes:
+                            break
+                        selected_lines.append(line)
+                        used_bytes += line_bytes
+                effective_end = start_line + len(selected_lines) - 1
+                content_str = "".join(selected_lines)
+                truncated = effective_end < total_lines
+
                 return {
                     "status": "success",
                     "tool": "read_file",
-                    "path":arguments['path'],
                     "result": {
-                        "content": content
+                        "path": arguments['path'],
+                        "content": content_str,
+                        "start_line": start_line,
+                        "end_line": effective_end,
+                        "total_lines": total_lines,
+                        "truncated": truncated
                     }
                 }
-            except FileNotFoundError as e:
-                Logger.error(f"Tool 'read_file' failed: File not found path={arguments['path']} ({e})")
+            except FileNotFoundError:
+                Logger.error(f"Tool 'read_file' failed: File not found path={arguments['path']}")
                 return {
                     "status": "error",
                     "tool": "read_file",
-                    "path": arguments['path'],
-                    "result": {
-                        "error_msg": f"File not found: {e}"
+                    "error": {
+                        "code": "FILE_NOT_FOUND",
+                        "message": f"File '{arguments['path']}' does not exist."
                     }
                 }
-            except PermissionError as e:
-                Logger.error(f"Tool 'read_file' failed: Permission denied for path={arguments['path']} ({e})")
+            except PermissionError:
+                Logger.error(f"Tool 'read_file' failed: Permission denied for path={arguments['path']}")
                 return {
                     "status": "error",
                     "tool": "read_file",
-                    "path": arguments['path'],
-                    "result": {
-                        "error_msg": f"Permission denied: {e}"
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": f"Permission denied while reading '{arguments['path']}'."
                     }
                 }
-            except UnicodeDecodeError as e:
-                Logger.error(f"Tool 'read_file' failed: Invalid UTF-8 for path={arguments['path']} ({e})")
+            except UnicodeDecodeError:
+                Logger.error(f"Tool 'read_file' failed: Invalid UTF-8 for path={arguments['path']}")
                 return {
                     "status": "error",
                     "tool": "read_file",
-                    "path": arguments['path'],
-                    "result": {
-                        "error_msg": f"File is not valid UTF-8: {e}"
+                    "error": {
+                        "code": "INVALID_ENCODING",
+                        "message": f"File '{arguments['path']}' is not valid UTF-8 text."
                     }
                 }
             
         
             
         elif name=="replace":
-            edit_result = advanced_edit_file(
+            edit_result = replace_code(
                 file_path=os.path.join(CURRENT_PATH, arguments['path']),
                 search=arguments['search'],
                 replace=arguments['replace'],
@@ -1417,3 +1265,198 @@ def execute_tool(name: str, arguments: dict):
                 "error_msg": str(e)
             }
         }
+
+
+class DeepSeekClient:
+    """Client for interacting with the DeepSeek chat API."""
+    def __init__(self, cookies, headers):
+        self.session = requests.Session()
+
+        self.session.cookies.update(cookies)
+        self.session.headers.update(headers)
+        self.base_url = "https://chat.deepseek.com/api/v0"
+        self.gator_url = "https://gator.volces.com/list"
+        self.session_id = str(uuid.uuid4())
+        self.web_id = str(uuid.uuid4().int)[:19]  # Dynamic web_id
+        self.user_unique_id = str(uuid.uuid4())
+
+    def _report_telemetry(self, event, params):
+        """Reports telemetry events to the Volcano Engine logger."""
+        payload = [{
+            "events": [{
+                "event": event,
+                "params": json.dumps(params),
+                "local_time_ms": int(time.time() * 1000),
+                "is_bav": 0,
+                "session_id": self.session_id
+            }],
+            "user": {
+                "user_unique_id": self.user_unique_id,
+                "web_id": self.web_id
+            },
+            "header": {
+                "app_id": 20006317,
+                "os_name": "windows",
+                "platform": "web",
+                "browser": "Chrome",
+                "browser_version": "149.0.0.0"
+            },
+            "local_time": int(time.time()),
+            "verbose": 1
+        }]
+        # Reporting telemetry usually doesn't raise error on failure in production
+        try:
+            self.session.post(self.gator_url, json=payload)
+        except Exception as e:
+            Logger.error(f"Telemetry reporting failed: {e}")
+
+    def _request(self, method, url, **kwargs):
+        """Centralized request method with standard error handling."""
+        try:
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            Logger.error(f"API request failed: {e}")
+            raise
+
+    def create_chat(self):
+        """Creates a new chat session."""
+        Logger.info("Creating new chat session...")
+        response = self._request("POST", f"{self.base_url}/chat_session/create", json={})
+        session_id = response.json()["data"]['biz_data']['chat_session']["id"]
+        Logger.success(f"Chat session created: {session_id}")
+        return session_id
+
+    def fetch_chats(self):
+        """Fetches a list of chat sessions."""
+        Logger.info("Fetching chat sessions...")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat_session/fetch_page",
+            params={"lte_cursor.pinned": "false"}
+        )
+        chats = response.json()["data"]["biz_data"]["chat_sessions"]
+        Logger.success(f"Fetched {len(chats)} chat sessions.")
+        return chats
+
+    def get_chat_history(self, chat_session_id):
+        """Gets the history messages for a given chat session."""
+        Logger.info(f"Fetching chat history for session: {chat_session_id}")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat/history_messages",
+            params={"chat_session_id": chat_session_id}
+        )
+        history = response.json()["data"]["biz_data"]
+        Logger.success(f"Fetched history for session: {chat_session_id}")
+        return history
+    
+    def get_last_message_id(self, chat_session_id):
+        """Gets the history messages for a given chat session."""
+        Logger.info(f"Fetching chat history for session: {chat_session_id}")
+        response = self._request(
+            "GET",
+            f"{self.base_url}/chat/history_messages",
+            params={"chat_session_id": chat_session_id}
+        )
+        messageId = response.json()["data"]["biz_data"]['chat_session']['current_message_id']
+        Logger.success(f"Fetched history for session: {chat_session_id}")
+        return int(messageId)
+
+
+    def _solve_pow(self, target_path, scene):
+        """Acquires, solves, and reports telemetry for the PoW challenge."""
+        
+        # 1. Request challenge
+        response = self._request(
+            "POST",
+            f"{self.base_url}/chat/create_pow_challenge",
+            json={"target_path": target_path}
+        )
+        challenge_data = response.json()["data"]["biz_data"]["challenge"]
+        
+        # 2. Report Start Telemetry
+        self._report_telemetry("preparePowChallengeAndSolve", {"ds_scene": scene})
+        self._report_telemetry("powSolveChallengeStart", {"ds_scene": scene})
+        
+        # 3. Solve
+        start_time = time.time()
+        wasm_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sha3_wasm_bg.7b9ca65ddd.wasm')
+        if not os.path.exists(wasm_file):
+            raise FileNotFoundError(f"Required WASM file not found: {wasm_file}")
+            
+        answer = compute_pow_answer(
+            algorithm=challenge_data["algorithm"],
+            challenge_str=challenge_data["challenge"],
+            salt=challenge_data["salt"],
+            difficulty=challenge_data["difficulty"],
+            expire_at=challenge_data["expire_at"],
+            signature=challenge_data["signature"],
+            target_path=challenge_data["target_path"],
+            wasm_path=wasm_file
+        )
+        duration = (time.time() - start_time) * 1000
+        
+        # 4. Report Success Telemetry
+        self._report_telemetry("powSolveChallengeSuccess", {"ds_scene": scene, "ds_duration": duration})
+        self._report_telemetry("powPrepared", {"ds_scene": scene, "ds_answer": answer, "ds_duration": duration})
+        
+        challenge_data["answer"] = answer
+        
+        # 5. Prepare payload
+        payload = {
+            "algorithm": challenge_data["algorithm"],
+            "challenge": challenge_data["challenge"],
+            "salt": challenge_data["salt"],
+            "answer": challenge_data["answer"],
+            "signature": challenge_data["signature"],
+            "target_path": challenge_data['target_path'],
+        }
+        
+        json_str = json.dumps(payload, separators=(",", ":"))
+        return base64.b64encode(json_str.encode()).decode()
+
+    def send_prompt(self, prompt, chat_session_id, parent_message_id=None,thinking_mode=True):
+        """Sends a prompt to the specified chat session."""
+        target_path = "/api/v0/chat/completion"
+        pow_token = self._solve_pow(target_path, "completion_like")
+
+        headers = self.session.headers.copy()
+        headers["x-ds-pow-response"] = pow_token
+
+        json_data = {
+            'chat_session_id': chat_session_id,
+            'parent_message_id': parent_message_id,
+            'model_type': 'expert',
+            'prompt': prompt,
+            'ref_file_ids': [],
+            'thinking_enabled': thinking_mode,
+            'search_enabled': False,
+            'action': None,
+            'preempt': False,
+        }
+
+        response = self._request(
+            "POST",
+            f"{self.base_url}/chat/completion",
+            headers=headers,
+            json=json_data,
+            stream=True
+        )
+        return response
+
+
+
+
+def load_system_prompt(path: str = "sys.md") -> str:
+    """Loads the system prompt from the specified file."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def create_client() -> DeepSeekClient:
+    """Creates and configures a DeepSeekClient using validated configuration."""
+    Config.load()
+    return DeepSeekClient(Config.get_cookies(), Config.get_headers())
+

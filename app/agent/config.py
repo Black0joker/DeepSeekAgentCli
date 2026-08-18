@@ -45,7 +45,7 @@ class Config:
             # Fallback: try current directory / system environment
             load_dotenv()
             Logger.info("Loaded .env from current directory or system environment")
-        required_vars = ["DS_SMIDV2", "DS_AWS_WAF_TOKEN", "DS_SESSION_ID", "DS_AUTHORIZATION"]
+        required_vars = ["DS_SMIDV2", "DS_SESSION_ID", "DS_AUTHORIZATION"]
         missing = [var for var in required_vars if not os.getenv(var)]
         
         if missing:

@@ -1,7 +1,5 @@
-import asyncio
 import os
 import sys
-from rich.status import Status
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
@@ -16,6 +14,8 @@ from .widgets import Logo
 from .state import AppState
 from app.command_defs import COMMANDS
 from .agent_wrapper import AgentWrapper
+from .widgets.tool_writer import format_tool_done
+from .widgets.tool_entry import ToolCallEntry
 from app.theme import (
     BG_MAIN, BG_INPUT, TEXT_PRIMARY, TEXT_SECONDARY,
     BORDER_LIGHT, BORDER_MEDIUM, ACCENT_RGB,
@@ -106,6 +106,10 @@ class MainApp(App):
         self.waiting_for_agent_response = False
         self.waiting_for_permission_response = False
         self.timer_active = False
+        # Maps agent call_id -> ToolCallEntry widget currently running
+        self._tool_entries = {}
+        # Buffer for streaming thinking text into the status bar line by line
+        self._thinking_buffer = ""
         
 
     def compose(self) -> ComposeResult:
@@ -145,8 +149,11 @@ class MainApp(App):
         callbacks = {
             'on_message': self._on_agent_message,
             'on_tool': self._on_agent_tool,
+            'on_tool_result': self._on_agent_tool_result,
+            'on_thinking': self._on_agent_thinking,
+            'on_thinking_done': self._on_agent_thinking_done,
             'on_status': self._on_agent_status,
-            # 'on_question': self._on_agent_question,
+            'on_question': self._on_agent_question,
             'on_finish': self._on_agent_finish,
             'on_error': self._on_agent_error,
             'on_permission_request': self._on_permission_request,
@@ -208,7 +215,12 @@ class MainApp(App):
         self.suggestions.hide()
         self.suggestions.refresh()
 
-        if text.startswith("/"):
+        if self.waiting_for_agent_response:
+            # Agent is waiting for user's answer to a question
+            self.waiting_for_agent_response = False
+            self.agent.provide_response(text)
+            self.set_status_with_input("Thinking...")
+        elif text.startswith("/"):
             self.handle_command(text, conversation, status)
         else:
             # Start the agent with the user's prompt
@@ -262,6 +274,8 @@ class MainApp(App):
             return
         # Disable input and set status
         self.set_status_with_input("Thinking...")
+        # Reset thinking stream buffer for the new run
+        self._thinking_buffer = ""
         # Run agent in background thread
         self.agent.run(prompt)
 
@@ -389,96 +403,81 @@ class MainApp(App):
         self.call_after_refresh(self._scroll_to_bottom)
 
     def _on_agent_tool(self, tool_data: dict) -> None:
-        """Called when agent executes a tool. Displays tool name with relevant arguments."""
+        """Called when the agent starts executing a tool.
+
+        Mounts a live ToolCallEntry (animated spinner) that will be updated
+        in place when the tool result arrives.
+        """
         tool = tool_data.get('tool', 'unknown')
         args = tool_data.get('arguments', {})
+        call_id = tool_data.get('call_id')
         conversation = self.query_one("#conversation")
 
-        # Display names for all tools
-        display_names = {
-            "read_file": "ReadFile",
-            "list_directory": "ListDir",
-            "write_file": "WriteFile",
-            "run_command": "RunCommand",
-            "replace": "Replace",
-            "glob": "Glob",
-            "grep_search": "GrepSearch",
-            "run_shell_command": "RunCommand",
-            "list_background_processes": "ListBgProcesses",
-            "read_background_output": "ReadBgOutput",
-            "kill_process": "KillProcess",
-            "enter_plan_mode": "PlanMode",
-            "google_web_search": "WebSearch",
-            "web_fetch": "WebFetch",
-            "current_path": "CurrentPath",
-            "search_file": "SearchFile",
-        }
-        display = display_names.get(tool, tool)
+        entry = ToolCallEntry(tool, args, call_id=call_id)
+        conversation.mount(entry)
 
-        # Build descriptive message based on tool type
-        if tool in ("run_command", "run_shell_command"):
-            cmd = args.get('command', '')
-            bg = args.get('background', False)
-            if bg:
-                msg = f"[bg] {cmd}"
-            else:
-                msg = cmd
-        elif tool in ("read_file", "write_file", "replace"):
-            path = args.get('path', '') or args.get('filePath', '')
-            msg = path
-        elif tool == "list_directory":
-            path = args.get('path', '.')
-            msg = path
-        elif tool == "current_path":
-            msg = ""
-        elif tool == "search_file":
-            pattern = args.get('pattern', '')
-            path = args.get('path', '')
-            msg = f"{pattern} in {path}" if path else pattern
-        elif tool == "grep_search":
-            pattern = args.get('pattern', '')
-            path = args.get('path', '')
-            include = args.get('include', '')
-            parts = [f'"{pattern}"']
-            if path:
-                parts.append(f"in {path}")
-            if include:
-                parts.append(f"[{include}]")
-            msg = " ".join(parts)
-        elif tool == "glob":
-            pattern = args.get('pattern', '*')
-            path = args.get('path', '')
-            msg = f"{pattern}" + (f" in {path}" if path else "")
-        elif tool == "read_background_output":
-            proc_id = args.get('id', '')
-            msg = proc_id
-        elif tool == "kill_process":
-            proc_id = args.get('id', '')
-            msg = proc_id
-        elif tool == "enter_plan_mode":
-            plan = args.get('plan', True)
-            msg = "ON" if plan else "OFF"
-        elif tool == "google_web_search":
-            query = args.get('query', '')
-            msg = f'"{query}"'
-        elif tool == "web_fetch":
-            url = args.get('url', '')
-            msg = url
-        elif tool == "list_background_processes":
-            msg = ""
-        else:
-            msg = ""
+        if call_id:
+            # Safety cap: discard stale mappings if the result never arrived
+            if len(self._tool_entries) > 100:
+                self._tool_entries.clear()
+            self._tool_entries[call_id] = entry
 
-        # Build the styled output
-        check = Text("\u2713 ", style=ACCENT_RGB)
-        display_text = Text(display, style="bold")
-        if msg:
-            msg_text = Text(f" \u00b7 {msg}", style="dim")
-            tool_msg = Text.assemble(check, display_text, msg_text)
-        else:
-            tool_msg = Text.assemble(check, display_text)
-        conversation.write(tool_msg)
         self.call_after_refresh(self._scroll_to_bottom)
+
+    def _on_agent_tool_result(self, tool_data: dict) -> None:
+        """Called after a tool has finished executing.
+
+        Updates the matching ToolCallEntry in place; falls back to writing
+        a static line when no running entry is found.
+        """
+        tool = tool_data.get('tool', 'unknown')
+        args = tool_data.get('arguments', {})
+        result = tool_data.get('result', {})
+        call_id = tool_data.get('call_id')
+
+        entry = self._tool_entries.pop(call_id, None) if call_id else None
+        if entry is not None:
+            entry.complete(result)
+        else:
+            # Fallback: no tracked entry (e.g. session restored mid-run)
+            conversation = self.query_one("#conversation")
+            main, detail = format_tool_done(tool, args, result)
+            if detail is not None:
+                main.append("\n")
+                main.append_text(detail)
+            conversation.write(main)
+
+        self.call_after_refresh(self._scroll_to_bottom)
+
+    # ---- Thinking stream (status bar, line by line) ----
+
+    def _on_agent_thinking(self, chunk: str) -> None:
+        """Stream a thinking chunk into the status bar, line by line."""
+        if not chunk:
+            return
+        self._thinking_buffer += chunk
+        # Emit every completed line; keep the partial trailing line buffered
+        while "\n" in self._thinking_buffer:
+            line, self._thinking_buffer = self._thinking_buffer.split("\n", 1)
+            self._show_thinking_line(line)
+
+    def _on_agent_thinking_done(self, _data) -> None:
+        """Flush any remaining partial thinking line when thinking ends."""
+        if self._thinking_buffer:
+            remaining = self._thinking_buffer
+            self._thinking_buffer = ""
+            self._show_thinking_line(remaining)
+
+    def _show_thinking_line(self, line: str) -> None:
+        """Display one thinking line in the status bar (truncated to fit)."""
+        line = line.strip()
+        if not line:
+            return
+        max_len = 100
+        if len(line) > max_len:
+            line = line[: max_len - 1] + "\u2026"
+        status_bar = self.query_one("#status")
+        status_bar.set_status(f"\u2727 {line}")
 
     def _on_agent_status(self, status: str) -> None:
         """Called when agent status changes."""
@@ -509,8 +508,13 @@ class MainApp(App):
     def _on_agent_question(self, question: str) -> None:
         """Called when agent asks a question."""
         conversation = self.query_one("#conversation")
-        conversation.write(f"[white]Agent asks: {question}[/white]")
+        styled = Text("\u2726 Agent asks: ", style=ACCENT_RGB)
+        styled.append(question, style="bold white")
+        conversation.write(styled)
         self.waiting_for_agent_response = True
+        self.timer_active = False
+        status_bar = self.query_one("#status")
+        status_bar.set_status("Waiting for your answer...")
         input_box = self.query_one("#input_box")
         input_box.disabled = False
         input_box.focus()
@@ -620,6 +624,29 @@ class MainApp(App):
         self.agent.provide_permission_response(decision)
         self.call_after_refresh(self._scroll_to_bottom)
 
+    def _extract_widget_text(self, widget) -> str:
+        """Recursively extract text content from a widget (handles Container, Static, etc.)."""
+        from textual.widgets import Static
+        from textual.containers import Container
+        if isinstance(widget, Static):
+            try:
+                renderable = widget.render()
+                return str(renderable) if renderable else ""
+            except Exception:
+                return ""
+        elif hasattr(widget, 'children'):
+            # Container or similar - recurse into children
+            parts = []
+            for child in widget.children:
+                parts.append(self._extract_widget_text(child))
+            return "\n".join(parts)
+        else:
+            try:
+                renderable = widget.render()
+                return str(renderable) if renderable else ""
+            except Exception:
+                return ""
+
     def _export_conversation(self, conversation) -> None:
         """Export the current conversation to a Markdown file."""
         import datetime
@@ -630,11 +657,7 @@ class MainApp(App):
             "",
         ]
         for child in children:
-            try:
-                renderable = child.render()
-                text = str(renderable) if renderable else ""
-            except Exception:
-                text = str(child)
+            text = self._extract_widget_text(child)
             if text.strip():
                 lines.append(text)
                 lines.append("")

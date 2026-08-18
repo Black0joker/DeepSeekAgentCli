@@ -1,9 +1,7 @@
-import sys
 import os
 import json
-import asyncio
-import threading,traceback
-from pathlib import Path
+import threading
+import uuid
 from typing import Callable, Dict, Any, Optional
 
 AgentSystemMd = os.path.join(os.path.dirname(__file__), "agent", "system.md")
@@ -27,7 +25,8 @@ class AgentWrapper:
         self.session_id = None
         self.parent_message_id = None
         self.system_prompt = None
-        self.running = False
+        self._running = False
+        self._running_lock = threading.Lock()
         self.thread = None
         self.callbacks = {}
         self.pending_response = None
@@ -36,6 +35,16 @@ class AgentWrapper:
         self.permission_response_event = threading.Event()
         self.session_allowed_tools = set()
         self.system_prompt_sent = threading.Event()
+
+    @property
+    def running(self) -> bool:
+        with self._running_lock:
+            return self._running
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        with self._running_lock:
+            self._running = value
         
     def initialize(self):
         """Initialize the agent client and session. Does NOT send the system prompt."""
@@ -99,7 +108,7 @@ class AgentWrapper:
             if not self.system_prompt_sent.is_set():
                 self._call_callback('on_status', 'Sending System Prompt')
                 thinking = self.app.state.thinking_mode if hasattr(self.app, 'state') else True
-                response = self.client.send_prompt(self.system_prompt, self.session_id, thinking_mode=thinking)
+                response = self.client.send_prompt(self.system_prompt, self.session_id,thinking_mode=False)
                 actions = parse_sse(response.iter_lines(decode_unicode=True))
                 for action in actions:
                     if action['type'] == 'message_id':
@@ -150,10 +159,25 @@ class AgentWrapper:
             results = []
             
             for action in actions:
+
+                if action['type']=="error":
+                    self._call_callback('on_error', action['content'])
+                    return
+
                 if action['type'] == 'message_id':
                     self.parent_message_id = action['value']
                     continue
-                
+
+                elif action['type'] == 'thinking_delta':
+                    # Stream thinking content to the UI as it arrives
+                    self._call_callback('on_thinking', action['value'])
+                    continue
+
+                elif action['type'] == 'thinking_done':
+                    # THINK fragment finished; flush any partial UI line
+                    self._call_callback('on_thinking_done', True)
+                    continue
+
                 elif action['type'] == 'status':
                     Status = action['value']
                     if Status not in ['finished','waiting']:
@@ -168,16 +192,23 @@ class AgentWrapper:
                     return
                 
                 elif action['type'] == 'action':
-                    if (Status == 'running' or Status == 'waiting') and (action['value']['tool'] == 'user_response' or action['value']['tool'] == 'ask_user') :
+                    if (Status == 'running' or Status == 'waiting') and action['value']['tool'] == 'user_response':
                         user_response = action['value']['arguments'].get('description', '')
                         self._call_callback('on_message', user_response)
-                        continue
+                        return
+
+                    elif (Status == 'running' or Status == 'waiting') and action['value']['tool'] == 'ask_user':
+                        question = action['value']['arguments'].get('question', '')
+                        self._call_callback('on_message', question)
+
+                        return
                     
                     elif Status == 'running':
                         tool = action['value']['tool']
                         args = action['value']['arguments']
-                        
-                        self._call_callback('on_tool', {'tool': tool, 'arguments': args})
+                        call_id = str(uuid.uuid4())[:8]
+
+                        self._call_callback('on_tool', {'tool': tool, 'arguments': args, 'call_id': call_id})
                         
                         # Check mode and permission
                         mode = self.app.state.mode if hasattr(self.app, 'state') else "permission"
@@ -190,7 +221,9 @@ class AgentWrapper:
                             else:
                                 decision = self._request_permission(tool, args)
                                 if decision == "reject":
-                                    results.append({"status": "error", "tool": tool, "result": {"error_msg": "Tool execution rejected by user."}})
+                                    reject_result = {"status": "error", "tool": tool, "result": {"error_msg": "Tool execution rejected by user."}}
+                                    results.append(reject_result)
+                                    self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': reject_result, 'call_id': call_id})
                                     prompt = f"Tool output:\n{json.dumps(results)}"
                                     continue
                                 elif decision == "allow_session":
@@ -203,14 +236,14 @@ class AgentWrapper:
                             set_working_directory(workspace)
                         result = execute_tool(tool, args)
                         results.append(result)
+
+                        # Notify UI of the tool result (paired with on_tool via call_id)
+                        self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': result, 'call_id': call_id})
                         
                         # Prepare the next prompt with tool output
                         prompt = f"Tool output:\n{json.dumps(results)}"
                         continue
                     
-
-                            
-                        continue
                 else:
                     Logger.error(f"Unexpected status: {Status}")
                     # prompt="You must respond in json format"

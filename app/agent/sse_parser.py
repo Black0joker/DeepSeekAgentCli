@@ -12,6 +12,8 @@ Yields:
 - {"type": "message_id", "value": int}
 - {"type": "status", "value": str}
 - {"type": "action", "value": dict}
+- {"type": "thinking_delta", "value": str}   (streamed THINK fragment chunk)
+- {"type": "thinking_done", "value": True}   (THINK fragment finished)
 """
 import json
 import re
@@ -35,6 +37,8 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
     protocol = None          # "normal" | "thinking"
     collecting = False
     content = ""
+    last_fragment_type = None   # "THINK" | "RESPONSE" | None
+    thinking_active = False
 
     for line in lines:
         if not line or not line.startswith("data: "):
@@ -45,6 +49,9 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
         except json.JSONDecodeError:
             continue
 
+        if obj.get("type")=="error":
+            yield obj
+            return
         # ------------------------------------------------------
         # Initial response: detect protocol and get message_id
         # ------------------------------------------------------
@@ -66,14 +73,20 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                     "type": "message_id",
                     "value": message_id,
                 }
-            # Normal protocol may already contain a RESPONSE fragment.
+            # Normal protocol may already contain a THINK or RESPONSE fragment.
             if protocol == "normal":
                 fragments = response_obj.get("fragments", [])
                 if fragments:
                     last = fragments[-1]
-                    if last.get("type") == "RESPONSE":
+                    last_fragment_type = last.get("type")
+                    if last_fragment_type == "RESPONSE":
                         collecting = True
                         content = last.get("content", "")
+                    elif last_fragment_type == "THINK":
+                        thinking_active = True
+                        initial = last.get("content", "")
+                        if initial:
+                            yield {"type": "thinking_delta", "value": initial}
             continue
 
         # ------------------------------------------------------
@@ -95,15 +108,36 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                 and obj.get("o") == "APPEND"
             ):
                 fragments = obj.get("v", [])
-                if fragments and fragments[0].get("type") == "RESPONSE":
-                    collecting = True
-                    content = fragments[0].get("content", "")
-            elif collecting:
+                if fragments:
+                    new_last = fragments[-1]
+                    new_type = new_last.get("type")
+                    prev_type = last_fragment_type
+                    last_fragment_type = new_type
+                    if new_type == "RESPONSE":
+                        collecting = True
+                        content = new_last.get("content", "")
+                        if prev_type == "THINK" and thinking_active:
+                            thinking_active = False
+                            yield {"type": "thinking_done", "value": True}
+                    elif new_type == "THINK":
+                        thinking_active = True
+                        initial = new_last.get("content", "")
+                        if initial:
+                            yield {"type": "thinking_delta", "value": initial}
+            else:
                 path = obj.get("p")
+                value = obj.get("v")
                 if path == "response/fragments/-1/content":
-                    content += obj.get("v", "")
-                elif path is None and isinstance(obj.get("v"), str):
-                    content += obj["v"]
+                    if thinking_active:
+                        if isinstance(value, str) and value:
+                            yield {"type": "thinking_delta", "value": value}
+                    elif collecting and isinstance(value, str):
+                        content += value
+                elif path is None and isinstance(value, str):
+                    if thinking_active:
+                        yield {"type": "thinking_delta", "value": value}
+                    elif collecting:
+                        content += value
                 # Other paths (elapsed_secs, BATCH, etc.) are ignored
 
         # ------------------------------------------------------

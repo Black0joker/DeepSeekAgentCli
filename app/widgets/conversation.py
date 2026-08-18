@@ -12,7 +12,7 @@ class ConversationView(Container):
     """Conversation area that displays messages. It is meant to be placed inside a scrollable container."""
     DEFAULT_CSS = f"""
     .user-message {{
-        height:3;
+        height: auto;
         background: {BG_INPUT};
         padding: 1 1;
         margin: 2 0;
@@ -25,6 +25,7 @@ class ConversationView(Container):
         color: {ACCENT};
     }}
     .assistant-message {{
+        height: auto;
         margin: 1 0;
         color: {TEXT_PRIMARY};
         background: {BG_MAIN};
@@ -76,13 +77,13 @@ class ConversationView(Container):
 
             self.mount(container)
 
-        elif text.startswith("\u2726"):
+        elif text.startswith("✦"):
             # Assistant message with Markdown rendering
             content = text[1:].strip()
             markdown = Markdown(content, code_theme="monokai")
 
             container = Container(
-                markdown,
+                Static(markdown),
                 classes="assistant-message",
             )
 
