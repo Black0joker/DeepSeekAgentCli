@@ -1124,7 +1124,7 @@ def execute_tool(name: str, arguments: dict):
                 # serialized result would exceed the 20 KB cap. This avoids holding
                 # the whole file in memory and removes the repeated json.dumps
                 # re-serialization halving loop entirely (single pass instead).
-                MAX_RESULT_SIZE_KB = 20
+                MAX_RESULT_SIZE_KB = 100
                 max_bytes = MAX_RESULT_SIZE_KB * 1024
                 # Fixed envelope overhead (result object with empty content)
                 base_bytes = len(json.dumps({
@@ -1428,7 +1428,7 @@ class DeepSeekClient:
         json_data = {
             'chat_session_id': chat_session_id,
             'parent_message_id': parent_message_id,
-            'model_type': 'default',
+            'model_type': 'expert',
             'prompt': prompt,
             'ref_file_ids': [],
             'thinking_enabled': thinking_mode,
