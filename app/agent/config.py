@@ -56,12 +56,17 @@ class Config:
 
     @staticmethod
     def get_cookies():
-        return {
-            ".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae": os.getenv("DS_THUMBCACHE"),
+        cookies = {
             "smidV2": os.getenv("DS_SMIDV2"),
             # "aws-waf-token": os.getenv("DS_AWS_WAF_TOKEN"),
             "ds_session_id": os.getenv("DS_SESSION_ID"),
         }
+        # Optional cookie: only include it when configured, so requests never
+        # receives a None cookie value.
+        thumbcache = os.getenv("DS_THUMBCACHE")
+        if thumbcache:
+            cookies[".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae"] = thumbcache
+        return cookies
 
     @staticmethod
     def get_headers():

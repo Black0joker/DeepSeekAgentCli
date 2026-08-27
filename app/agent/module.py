@@ -32,14 +32,18 @@ _CERT_PATH = None
 
 # Background process tracking
 BACKGROUND_PROCESSES = {}
+# Terminal statuses that are eligible for cleanup after being reported.
+TERMINAL_PROCESS_STATUSES = ("completed", "failed", "timeout", "killed")
 PLAN_MODE_ENABLED = False
 _plan_mode_lock = threading.Lock()
 
+# Tools that are blocked while plan mode (read-only) is active.
+PLAN_MODE_BLOCKED_TOOLS = {
+    'write_file', 'replace', 'run_shell_command', 'code_interpreter', 'kill_process',
+}
+
 # Cached workspace path to avoid repeated os.path.abspath calls
 _CACHED_WORKSPACE_PATH = None
-
-def json_size_kb(results):
-    return len(json.dumps(results).encode('utf-8')) / 1024
 
 class _DDGParser(HTMLParser):
     """Reusable DuckDuckGo HTML parser. Defined at module level to avoid
@@ -110,11 +114,26 @@ def _resolve_cwd(cwd: str) -> str:
     return os.path.abspath(os.path.join(CURRENT_PATH, cwd))
 
 
+def _strip_surrounding_quotes(token: str) -> str:
+    """Strip one pair of matching surrounding quotes from a token."""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+        return token[1:-1]
+    return token
+
+
 def _parse_command(command: str):
     """Parse a command string into (args_list, first_command).
-    Falls back to whitespace splitting if shlex fails."""
+
+    On POSIX systems shlex runs in posix mode (backslash escapes apply).
+    On Windows, posix mode would consume backslashes in paths, so shlex
+    runs in non-posix mode and surrounding quotes are stripped manually.
+    Falls back to whitespace splitting if shlex fails.
+    """
     try:
-        parsed = shlex.split(command, posix=True)
+        if os.name == 'nt':
+            parsed = [_strip_surrounding_quotes(t) for t in shlex.split(command, posix=False)]
+        else:
+            parsed = shlex.split(command, posix=True)
         if not parsed:
             return [], ""
         return parsed, parsed[0]
@@ -217,12 +236,15 @@ def _run_background_process(proc_id: str, command: str, parsed_cmd, first_cmd: s
 
         with _state_lock:
             if proc_id in BACKGROUND_PROCESSES:
+                existing_status = BACKGROUND_PROCESSES[proc_id].get("status")
                 if timed_out:
                     BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines) + f"\nProcess timed out after {timeout}s"
-                    BACKGROUND_PROCESSES[proc_id]["status"] = "timeout"
+                    if existing_status != "killed":
+                        BACKGROUND_PROCESSES[proc_id]["status"] = "timeout"
                 else:
                     BACKGROUND_PROCESSES[proc_id]["output"] = "".join(output_lines)
-                    BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
+                    if existing_status != "killed":
+                        BACKGROUND_PROCESSES[proc_id]["status"] = "completed"
                     BACKGROUND_PROCESSES[proc_id]["returncode"] = returncode
 
     except Exception as ex:
@@ -406,8 +428,8 @@ def _handle_code_interpreter(arguments: dict) -> dict:
 
 def _handle_list_background_processes() -> dict:
     """Handle the list_background_processes tool with thread-safe state access.
-    
-    Returns completed processes on first request, then removes them from
+
+    Returns terminal processes on first request, then removes them from
     tracking and joins (closes) their threads after returning.
     """
     processes = []
@@ -418,7 +440,7 @@ def _handle_list_background_processes() -> dict:
         for proc_id, proc_info in list(BACKGROUND_PROCESSES.items()):
             thread = proc_info.get("thread")
             actual_status = proc_info["status"]
-            
+
             # Refresh status from thread state
             if thread is not None:
                 if thread.is_alive():
@@ -435,13 +457,13 @@ def _handle_list_background_processes() -> dict:
                 "source": "tracked"
             })
 
-            # If completed, mark for cleanup AFTER the response is built
-            if actual_status == "completed":
+            # If in a terminal state, mark for cleanup AFTER the response is built
+            if actual_status in TERMINAL_PROCESS_STATUSES:
                 completed_ids.append(proc_id)
                 if thread is not None:
                     threads_to_join.append(thread)
 
-        # Remove completed processes from tracking (after including them in response)
+        # Remove terminal processes from tracking (after including them in response)
         for proc_id in completed_ids:
             del BACKGROUND_PROCESSES[proc_id]
 
@@ -507,8 +529,8 @@ def _handle_read_background_output(arguments: dict) -> dict:
             }
         }
         
-        # If completed, remove from tracking and schedule thread join AFTER returning
-        if actual_status == "completed":
+        # If in a terminal state, remove from tracking and schedule thread join AFTER returning
+        if actual_status in TERMINAL_PROCESS_STATUSES:
             if thread is not None:
                 thread_to_join = thread
             del BACKGROUND_PROCESSES[proc_id]
@@ -603,116 +625,6 @@ def get_working_directory():
 
 
 
-EXPECTED_TOOLS=[
-  {
-    "tool": "current_path",
-    "arguments": {}
-  },
-  {
-    "tool": "list_directory",
-    "arguments": {
-      "path": "string"
-    }
-  },
-  {
-    "tool": "glob",
-    "arguments": {
-      "pattern": "string",
-      "path": "string (optional)"
-    }
-  },
-  {
-    "tool": "grep_search",
-    "arguments": {
-      "pattern": "string",
-      "path": "string (optional)",
-      "include": "string (optional)"
-    }
-  },
-  {
-      "tool": "read_file",
-      "arguments": {
-          "path": "string",
-          "start_line": "integer (optional)",
-          "end_line": "integer (optional)"
-      }
-  },
-  {
-    "tool": "replace",
-    "arguments": {
-      "path": "string",
-      "search": "string",
-      "replace": "string"
-    }
-  },
-  {
-    "tool": "write_file",
-    "arguments": {
-      "path": "string",
-      "content": "string"
-    }
-  },
-  {
-  "tool": "run_shell_command",
-  "arguments": {
-  "command": "string",
-  "cwd": "string (optional)",
-  "timeout": "integer (optional)"
-  }
-  },
-  {
-  "tool": "code_interpreter",
-  "arguments": {
-  "code": "string"
-  }
-  },
-  {
-    "tool": "list_background_processes",
-    "arguments": {}
-  },
-  {
-    "tool": "read_background_output",
-    "arguments": {
-      "id": "string"
-    }
-  },
-  {
-    "tool": "kill_process",
-    "arguments": {
-      "id": "string"
-    }
-  },
-  {
-    "tool": "enter_plan_mode",
-    "arguments": {
-      "plan": "boolean (true to enter plan mode, false to exit plan mode)"
-    }
-  },
-  {
-    "tool": "google_web_search",
-    "arguments": {
-      "query": "string"
-    }
-  },
-  {
-    "tool": "web_fetch",
-    "arguments": {
-      "url": "string"
-    }
-  },
-  {
-    "tool": "ask_user",
-    "arguments": {
-      "question": "string"
-    }
-  },
-  {
-    "tool": "user_response",
-    "arguments": {
-      "description": "string"
-    }
-  }
-]
 
 
 
@@ -723,6 +635,23 @@ EXPECTED_TOOLS=[
 
 def execute_tool(name: str, arguments: dict):
     """Executes a tool by name with the provided arguments."""
+    global PLAN_MODE_ENABLED
+    # Plan mode: block all state-changing tools while active.
+    if name in PLAN_MODE_BLOCKED_TOOLS:
+        with _plan_mode_lock:
+            plan_active = PLAN_MODE_ENABLED
+        if plan_active:
+            error_msg = (
+                "Plan mode is active: write/execute tools are blocked. "
+                "Call enter_plan_mode with plan=false to exit plan mode first."
+            )
+            Logger.warn(f"Tool '{name}' blocked: plan mode is active")
+            return {
+                "status": "error",
+                "tool": name,
+                "result": {"error_msg": error_msg}
+            }
+
     # Security: Validate file paths to prevent path traversal
     if name in ('read_file', 'write_file', 'replace', 'list_directory', 'run_shell_command', 'glob', 'grep_search'):
         if 'path' in arguments or 'cwd' in arguments:
@@ -879,8 +808,16 @@ def execute_tool(name: str, arguments: dict):
                                     })
                                     if len(results) >= max_results:
                                         break
-                    except (PermissionError, UnicodeDecodeError):
-                        pass
+                    except (PermissionError, UnicodeDecodeError) as e:
+                        Logger.error(f"Tool 'grep_search' failed: cannot read {search_path} ({e})")
+                        return {
+                            "status": "error",
+                            "tool": "grep_search",
+                            "result": {
+                                "path": arguments.get('path', '.'),
+                                "error_msg": f"Cannot read file: {e}"
+                            }
+                        }
                 else:
                     full_pattern = os.path.join(search_path, '**', include)
                     for filepath in glob_module.glob(full_pattern, recursive=True):
@@ -928,7 +865,6 @@ def execute_tool(name: str, arguments: dict):
             return _handle_kill_process(arguments)
 
         elif name=="enter_plan_mode":
-            global PLAN_MODE_ENABLED
             plan_value = arguments.get('plan', True)
             # Accept both bool and string representations
             if isinstance(plan_value, str):
@@ -1124,7 +1060,7 @@ def execute_tool(name: str, arguments: dict):
                 # serialized result would exceed the 20 KB cap. This avoids holding
                 # the whole file in memory and removes the repeated json.dumps
                 # re-serialization halving loop entirely (single pass instead).
-                MAX_RESULT_SIZE_KB = 100
+                MAX_RESULT_SIZE_KB = 20
                 max_bytes = MAX_RESULT_SIZE_KB * 1024
                 # Fixed envelope overhead (result object with empty content)
                 base_bytes = len(json.dumps({
@@ -1150,7 +1086,9 @@ def execute_tool(name: str, arguments: dict):
                         used_bytes += line_bytes
                 effective_end = start_line + len(selected_lines) - 1
                 content_str = "".join(selected_lines)
-                truncated = effective_end < total_lines
+                # Flag truncation only when the size cap cut the requested
+                # range short, not merely because the range ends before EOF.
+                truncated = effective_end < range_end
 
                 return {
                     "status": "success",
@@ -1328,30 +1266,42 @@ class DeepSeekClient:
         Logger.success(f"Chat session created: {session_id}")
         return session_id
 
-    def fetch_chats(self):
-        """Fetches a list of chat sessions."""
-        Logger.info("Fetching chat sessions...")
-        response = self._request(
-            "GET",
-            f"{self.base_url}/chat_session/fetch_page",
-            params={"lte_cursor.pinned": "false"}
-        )
-        chats = response.json()["data"]["biz_data"]["chat_sessions"]
-        Logger.success(f"Fetched {len(chats)} chat sessions.")
-        return chats
+    def fetch_chats(self, max_pages: int = 20):
+        """Fetches chat sessions, following pagination cursors when present.
 
-    def get_chat_history(self, chat_session_id):
-        """Gets the history messages for a given chat session."""
-        Logger.info(f"Fetching chat history for session: {chat_session_id}")
-        response = self._request(
-            "GET",
-            f"{self.base_url}/chat/history_messages",
-            params={"chat_session_id": chat_session_id}
-        )
-        history = response.json()["data"]["biz_data"]
-        Logger.success(f"Fetched history for session: {chat_session_id}")
-        return history
-    
+        Pages are followed on a best-effort basis: if the response exposes
+        an ``lte_cursor`` object it is expanded into ``lte_cursor.<field>``
+        request params (mirroring the existing param convention); otherwise
+        fetching stops. Duplicate IDs and empty pages also stop pagination.
+        """
+        Logger.info("Fetching chat sessions...")
+        all_chats = []
+        seen_ids = set()
+        params = {"lte_cursor.pinned": "false"}
+        for _page in range(max_pages):
+            response = self._request(
+                "GET",
+                f"{self.base_url}/chat_session/fetch_page",
+                params=params
+            )
+            biz_data = response.json()["data"]["biz_data"]
+            chats = biz_data.get("chat_sessions") or []
+            new_chats = [c for c in chats if c.get("id") not in seen_ids]
+            if not new_chats:
+                break
+            all_chats.extend(new_chats)
+            seen_ids.update(c.get("id") for c in new_chats)
+            cursor = biz_data.get("lte_cursor")
+            if isinstance(cursor, dict) and cursor:
+                next_params = {f"lte_cursor.{k}": v for k, v in cursor.items()}
+            elif isinstance(cursor, (str, int)) and cursor:
+                next_params = {"lte_cursor.id": cursor}
+            else:
+                break
+            params = {**params, **next_params}
+        Logger.success(f"Fetched {len(all_chats)} chat sessions.")
+        return all_chats
+
     def get_last_message_id(self, chat_session_id):
         """Gets the history messages for a given chat session."""
         Logger.info(f"Fetching chat history for session: {chat_session_id}")
@@ -1449,7 +1399,7 @@ class DeepSeekClient:
 
 
 
-def load_system_prompt(path: str = "sys.md") -> str:
+def load_system_prompt(path: str) -> str:
     """Loads the system prompt from the specified file."""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()

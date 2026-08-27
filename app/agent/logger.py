@@ -331,6 +331,7 @@ class Logger:
             "list_background_processes": "ListBgProcs",
             "read_background_output": "ReadBgOutput",
             "kill_process": "KillProcess",
+            "enter_plan_mode": "EnterPlanMode",
             "google_web_search": "WebSearch",
             "web_fetch": "WebFetch",
             "code_interpreter": "CodeInterpreter",

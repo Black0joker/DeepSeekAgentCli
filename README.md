@@ -24,7 +24,7 @@ python main.py
 ### Agent
 
 - **Autonomous Planning** — Observes, plans, acts, verifies, and adapts
-- **Rich Tool Execution** — 16 tools for file operations, search, shell commands, background processes, and web access
+- **Rich Tool Execution** — 17 tools for file operations, search, shell commands, background processes, and web access
 - **Advanced Code Editing** — 7-layer safety-first matching engine with confidence scoring, fuzzy candidate discovery, and atomic writes
 - **Background Process Management** — Run long-running commands asynchronously, track, read output, and kill them
 - **Permission Mode** — `auto` (all tools allowed) or `permission` (approve each write/exec tool)
@@ -43,14 +43,16 @@ python main.py
 | `search_file` | Search for files by name pattern |
 | `glob` | Find files matching glob patterns (e.g., `**/*.py`) |
 | `grep_search` | Regex/text search inside files with optional include filter |
-| `run_command` | Execute shell commands (legacy) |
 | `run_shell_command` | Execute commands with background support and timeout |
+| `code_interpreter` | Execute Python code via `python -c` |
 | `list_background_processes` | List all tracked background tasks |
 | `read_background_output` | Read output from a background process |
 | `kill_process` | Terminate a background process by ID |
-| `enter_plan_mode` | Toggle read-only plan mode |
+| `enter_plan_mode` | Toggle read-only plan mode (write/execute tools are blocked while active) |
 | `google_web_search` | Search the web for information |
 | `web_fetch` | Fetch content from web pages |
+| `ask_user` | Ask the user a question and wait for the answer |
+| `user_response` | Deliver the final response and finish the run |
 
 ### UI
 
@@ -59,6 +61,7 @@ python main.py
 - **Command Suggestions** — Type `/` to see all commands, arrow keys to navigate, Enter/Tab to select
 - **Status Bar** — Elapsed timer with animated spinner during agent processing
 - **Permission Selector** — Interactive allow once / allow for session / reject UI
+- **Streaming Responses** — `user_response`/`ask_user` text is detected directly in the SSE stream and rendered live, chunk by chunk, until the JSON ends
 - **Multi-threaded** — Agent runs in background threads, keeping the UI responsive
 
 ## Commands
@@ -69,11 +72,13 @@ python main.py
 | `/help` | Show available commands |
 | `/new` | Start a new conversation |
 | `/settings` | Display current settings |
-| `/quit` | Exit the application |
-| `/mode` | Set operation mode (auto/permission) |
+| `/theme [name]` | Show or switch the UI theme (presets: default, dracula, gruvbox, nord, monokai, solarized_dark) |
+| `/mode [auto|permission]` | Show or set operation mode |
 | `/set_workspace <path>` | Set the workspace directory |
 | `/change_chat <number>` | Switch to a chat session by number |
-| `/chats` | List all chat sessions |
+| `/chats` | List all chat sessions (follows pagination) |
+| `/export` | Export the current conversation to a Markdown file |
+| `/quit` | Exit the application |
 
 ## Architecture
 
@@ -81,34 +86,37 @@ python main.py
 DeepSeekCli/
 ├── main.py                  # Entry point
 ├── removeChats.py           # Utility to bulk-delete chat sessions
+├── test_sse_parser.py       # SSE parser test / smoke harness
 ├── requirements.txt         # Python dependencies
 ├── system.md                # System prompt for the autonomous agent
-├── project.md               # Project documentation
 ├── app/
 │   ├── app.py               # Main Textual App (UI layout, CSS, event handling)
 │   ├── agent_wrapper.py     # Bridges agent logic with Textual UI (background threads)
 │   ├── command_defs.py      # Canonical command definitions
-│   ├── commands.py          # Backward-compatible re-exports
+│   ├── commands/            # Backward-compatible re-exports of command_defs
 │   ├── theme/
-│   │   └── __init__.py      # Centralized color palette
+│   │   └── __init__.py      # Centralized palette + Textual theme builder
 │   ├── state/
-│   │   └── app_state.py     # Application state (model, workspace, mode, permissions)
+│   │   └── app_state.py     # Application state (model, workspace, mode)
 │   ├── agent/
-│   │   ├── module.py        # DeepSeekClient API, SSE parser, tool execution, BackgroundProcessManager
+│   │   ├── module.py        # DeepSeekClient API, tool execution, background processes
+│   │   ├── sse_parser.py    # SSE stream parser for DeepSeek responses
 │   │   ├── edit_file.py     # 7-layer safety-first code editing engine
 │   │   ├── config.py        # Environment configuration (.env loading)
-│   │   ├── logger.py        # Colored logging utility
-│   │   ├── algorithmFunction.py  # PoW (Proof of Work) WASM solver
+│   │   ├── logger.py        # Rotating file + console logging utility
+│   │   └── algorithmFunction.py  # PoW (Proof of Work) WASM solver
 │   └── widgets/
 │       ├── conversation.py  # Chat message display (Rich Text support)
 │       ├── input_box.py     # User input field with key handling
 │       ├── suggestions.py   # Command suggestion dropdown
 │       ├── permission.py    # Tool permission selector
-│       ├── footer.py        # Bottom status bar (workspace, branch, model, mode)
+│       ├── tool_entry.py    # Live tool-call entry with animated spinner
+│       ├── tool_writer.py   # Tool call/result formatting
+│       ├── footer.py        # Bottom status bar (workspace, branch, mode, thinking)
 │       ├── header.py        # Top header bar
 │       ├── status.py        # Elapsed time / spinner / status indicator
 │       └── logo.py          # Gradient ASCII logo
-├── config/                  # Configuration directory (reserved)
+├── config/                  # Configuration directory (theme.json)
 ├── assets/                  # Assets directory (reserved)
 └── logs/                    # Agent log files
 ```
@@ -157,10 +165,11 @@ All colors are centralized in `app/theme/__init__.py`:
 ## Build
 
 ```bash
-pyinstaller DeepSeekCli.spec
+pyinstaller --onefile --name DeepSeekCli main.py
 ```
 
-Outputs `DeepSeekCli.exe` in `dist/`.
+Outputs `DeepSeekCli.exe` in `dist/`. (`.spec` files are gitignored — keep a
+local copy if you maintain a custom spec.)
 
 ## Tech Stack
 

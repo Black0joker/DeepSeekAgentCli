@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Set
+from typing import Optional
 
 @dataclass
 class AppState:
@@ -11,8 +11,6 @@ class AppState:
     settings: dict = field(default_factory=dict)
     mode: str = "auto"  # "auto" or "permission"
     thinking_mode: bool = True  # "thinking" or "normal"
-    allowed_tools_session: Set[str] = field(default_factory=set)
-    allowed_tools_once: Set[str] = field(default_factory=set)
 
     def set_model(self, model: str) -> None:
         """Change the current model."""
@@ -37,8 +35,3 @@ class AppState:
         """Toggle thinking mode between True and False. Returns new mode label."""
         self.thinking_mode = not self.thinking_mode
         return "thinking" if self.thinking_mode else "normal"
-
-    def clear_allowed_tools(self) -> None:
-        """Clear all session and once permission caches."""
-        self.allowed_tools_session.clear()
-        self.allowed_tools_once.clear()

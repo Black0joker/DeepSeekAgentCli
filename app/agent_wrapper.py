@@ -80,10 +80,15 @@ class AgentWrapper:
         Expected callbacks:
         - on_message: Called when agent sends a message
         - on_tool: Called when agent executes a tool
+        - on_tool_result: Called with tool results
         - on_status: Called when agent status changes
+        - on_thinking: Called with streamed thinking chunks
+        - on_thinking_done: Called when a thinking chunk ends
+        - on_response_delta: Called with streamed user_response/ask_user text
         - on_question: Called when agent asks a question
         - on_finish: Called when agent finishes
         - on_error: Called on error
+        - on_permission_request: Called when a tool needs approval
         """
         self.callbacks = callbacks
     
@@ -107,8 +112,7 @@ class AgentWrapper:
             # Send system prompt on first run
             if not self.system_prompt_sent.is_set():
                 self._call_callback('on_status', 'Sending System Prompt')
-                thinking = self.app.state.thinking_mode if hasattr(self.app, 'state') else True
-                response = self.client.send_prompt(self.system_prompt, self.session_id,thinking_mode=False)
+                response = self.client.send_prompt(self.system_prompt, self.session_id, thinking_mode=False)
                 actions = parse_sse(response.iter_lines(decode_unicode=True))
                 for action in actions:
                     if action['type'] == 'message_id':
@@ -132,8 +136,9 @@ class AgentWrapper:
     
     def _run_agent_loop(self, prompt: str, max_iterations: int = 50):
         """Main agent loop - adapted from agent/main.py"""
-        first=False
+        first = False
         iteration = 0
+        malformed_streak = 0
         while True:
             try:
                 # Send prompt to DeepSeek API
@@ -145,118 +150,145 @@ class AgentWrapper:
                     thinking_mode=thinking,
                 )
 
-                if first==False:
+                if not first:
                     self._call_callback('on_status', 'running')
-                    first=True
+                    first = True
 
             except Exception as e:
                 self._call_callback('on_error', f"Failed to send prompt: {e}")
                 Logger.exception(f"Failed to send prompt: {e}")
                 return
-            
+
             Status = None
             actions = parse_sse(response.iter_lines(decode_unicode=True))
             results = []
-            
-            for action in actions:
+            progress = False
 
-                if action['type']=="error":
-                    self._call_callback('on_error', action['content'])
+            for action in actions:
+                atype = action.get('type')
+
+                if atype == 'error':
+                    self._call_callback('on_error', str(action.get('value', 'Unknown API error')))
                     return
 
-                if action['type'] == 'message_id':
-                    self.parent_message_id = action['value']
+                if atype == 'message_id':
+                    self.parent_message_id = action.get('value')
                     continue
 
-                elif action['type'] == 'thinking_delta':
+                elif atype == 'thinking_delta':
                     # Stream thinking content to the UI as it arrives
-                    self._call_callback('on_thinking', action['value'])
+                    self._call_callback('on_thinking', action.get('value', ''))
                     continue
 
-                elif action['type'] == 'thinking_done':
+                elif atype == 'thinking_done':
                     # THINK fragment finished; flush any partial UI line
                     self._call_callback('on_thinking_done', True)
                     continue
 
-                elif action['type'] == 'status':
-                    Status = action['value']
-                    if Status not in ['finished','waiting']:
-                        
+                elif atype == 'response_delta':
+                    # Streamed user_response/ask_user text while the JSON is
+                    # still arriving; forward to the UI for live display.
+                    self._call_callback('on_response_delta', action.get('value', ''))
+                    continue
+
+                elif atype == 'status':
+                    Status = action.get('value')
+                    if Status not in ('finished', 'waiting'):
                         self._call_callback('on_status', Status)
                     continue
-                
-                elif Status == 'finished':
-                    desc = action['value']['arguments'].get('description', '')
-                    self._call_callback('on_status', Status)
-                    self._call_callback('on_finish', desc)
-                    return
-                
-                elif action['type'] == 'action':
-                    if (Status == 'running' or Status == 'waiting') and action['value']['tool'] == 'user_response':
-                        user_response = action['value']['arguments'].get('description', '')
+
+                elif atype == 'action':
+                    progress = True
+                    value = action.get('value') or {}
+                    tool = value.get('tool')
+                    args = value.get('arguments') if isinstance(value.get('arguments'), dict) else {}
+
+                    if Status == 'finished':
+                        desc = args.get('description', '')
+                        self._call_callback('on_status', Status)
+                        self._call_callback('on_finish', desc)
+                        return
+
+                    if tool == 'user_response':
+                        user_response = args.get('description', '')
                         self._call_callback('on_message', user_response)
                         return
 
-                    elif (Status == 'running' or Status == 'waiting') and action['value']['tool'] == 'ask_user':
-                        question = action['value']['arguments'].get('question', '')
-                        self._call_callback('on_message', question)
-
-                        return
-                    
-                    elif Status == 'running':
-                        tool = action['value']['tool']
-                        args = action['value']['arguments']
-                        call_id = str(uuid.uuid4())[:8]
-
-                        self._call_callback('on_tool', {'tool': tool, 'arguments': args, 'call_id': call_id})
-                        Logger.tool(tool, args)
-
-                        # Check mode and permission
-                        mode = self.app.state.mode if hasattr(self.app, 'state') else "permission"
-                        read_only_tools = ['read_file', 'list_directory', 'current_path', 'search_file', 'glob', 'grep_search', 'list_background_processes', 'read_background_output', 'enter_plan_mode']
-                        if mode == "permission" and tool not in read_only_tools:
-                            # Check if tool is in session allowed set
-                            if tool in self.session_allowed_tools:
-                                # Already allowed for this session
-                                pass
-                            else:
-                                decision = self._request_permission(tool, args)
-                                if decision == "reject":
-                                    reject_result = {"status": "error", "tool": tool, "result": {"error_msg": "Tool execution rejected by user."}}
-                                    results.append(reject_result)
-                                    Logger.tool_result(tool, reject_result)
-                                    self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': reject_result, 'call_id': call_id})
-                                    prompt = f"Tool output:\n{json.dumps(results)}"
-                                    continue
-                                elif decision == "allow_session":
-                                    self.session_allowed_tools.add(tool)
-                                # else allow_once, proceed
-                        
-                        # Execute the tool with current workspace
-                        workspace = self.app.state.workspace if hasattr(self.app, 'state') else None
-                        if workspace:
-                            set_working_directory(workspace)
-                        result = execute_tool(tool, args)
-                        results.append(result)
-                        Logger.tool_result(tool, result)
-
-                        # Notify UI of the tool result (paired with on_tool via call_id)
-                        self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': result, 'call_id': call_id})
-                        
-                        # Prepare the next prompt with tool output
-                        prompt = f"Tool output:\n{json.dumps(results)}"
+                    if tool == 'ask_user':
+                        question = args.get('question', '')
+                        self._call_callback('on_question', question)
+                        answer = self._wait_for_response()
+                        if answer is None:
+                            return
+                        prompt = answer
                         continue
-                    
+
+                    call_id = str(uuid.uuid4())[:8]
+
+                    self._call_callback('on_tool', {'tool': tool, 'arguments': args, 'call_id': call_id})
+                    Logger.tool(tool, args)
+
+                    # Check mode and permission
+                    mode = self.app.state.mode if hasattr(self.app, 'state') else "permission"
+                    read_only_tools = ['read_file', 'list_directory', 'current_path', 'search_file', 'glob', 'grep_search', 'list_background_processes', 'read_background_output', 'enter_plan_mode']
+                    if mode == "permission" and tool not in read_only_tools:
+                        # Check if tool is in session allowed set
+                        if tool in self.session_allowed_tools:
+                            # Already allowed for this session
+                            pass
+                        else:
+                            decision = self._request_permission(tool, args)
+                            if decision == "reject":
+                                reject_result = {"status": "error", "tool": tool, "result": {"error_msg": "Tool execution rejected by user."}}
+                                results.append(reject_result)
+                                Logger.tool_result(tool, reject_result)
+                                self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': reject_result, 'call_id': call_id})
+                                prompt = f"Tool output:\n{json.dumps(results)}"
+                                continue
+                            elif decision == "allow_session":
+                                self.session_allowed_tools.add(tool)
+                            # else allow_once, proceed
+
+                    # Execute the tool with current workspace
+                    workspace = self.app.state.workspace if hasattr(self.app, 'state') else None
+                    if workspace:
+                        set_working_directory(workspace)
+                    result = execute_tool(tool, args)
+                    results.append(result)
+                    Logger.tool_result(tool, result)
+
+                    # Notify UI of the tool result (paired with on_tool via call_id)
+                    self._call_callback('on_tool_result', {'tool': tool, 'arguments': args, 'result': result, 'call_id': call_id})
+
+                    # Prepare the next prompt with tool output
+                    prompt = f"Tool output:\n{json.dumps(results)}"
+                    continue
+
                 else:
-                    Logger.error(f"Unexpected status: {Status}")
-                    # prompt="You must respond in json format"
-                    # self._call_callback('on_status', 'There is an error. it respond in normal text not json')
-                    return
+                    Logger.warn(f"Ignoring unexpected SSE event type: {atype!r} (status={Status})")
+                    continue
 
             iteration += 1
             if iteration > max_iterations:
                 self._call_callback('on_error', f'Agent exceeded maximum iterations ({max_iterations}). Stopping to prevent infinite loop.')
                 return
+
+            if not progress:
+                # The response contained no usable JSON state (e.g. plain text).
+                # Send a corrective prompt instead of resending unchanged input,
+                # and abort after too many consecutive malformed responses.
+                malformed_streak += 1
+                if malformed_streak >= 3:
+                    self._call_callback('on_error', 'Model produced 3 consecutive responses without a valid JSON state. Aborting.')
+                    return
+                Logger.warn(f"Response contained no valid JSON state ({malformed_streak}/3). Requesting protocol compliance.")
+                prompt = (
+                    "Your last response did not contain a valid JSON state object. "
+                    "You MUST reply with exactly one JSON object wrapped in a ```json "
+                    "markdown code fence, as required by the Output Protocol. Try again."
+                )
+            else:
+                malformed_streak = 0
 
     def _wait_for_response(self) -> Optional[str]:
         """Wait for the user to provide a response to the agent's question."""

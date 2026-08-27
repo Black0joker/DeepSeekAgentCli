@@ -21,7 +21,6 @@ from typing import Optional
 from rich.text import Text
 from textual.widgets import Static
 
-from app.theme import ACCENT, SUCCESS, ERROR
 from app.widgets.tool_writer import format_tool_running, format_tool_done
 
 
@@ -35,19 +34,20 @@ _SPINNER_INTERVAL = 0.12
 class ToolCallEntry(Static):
     """A single conversation entry representing one tool invocation."""
 
-    DEFAULT_CSS = f"""
-    ToolCallEntry {{
+    # Colors come from CSS variables provided by the active Textual theme.
+    DEFAULT_CSS = """
+    ToolCallEntry {
         height: auto;
         margin: 1 1 1 2;
         padding: 0 1;
-        border-left: thick {ACCENT};
-    }}
-    ToolCallEntry.success {{
-        border-left: thick {SUCCESS};
-    }}
-    ToolCallEntry.error {{
-        border-left: thick {ERROR};
-    }}
+        border-left: thick $accent;
+    }
+    ToolCallEntry.success {
+        border-left: thick $success;
+    }
+    ToolCallEntry.error {
+        border-left: thick $error;
+    }
     """
 
     def __init__(self, tool: str, args: dict, call_id: Optional[str] = None, **kwargs):

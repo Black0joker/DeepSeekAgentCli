@@ -14,10 +14,118 @@ Yields:
 - {"type": "action", "value": dict}
 - {"type": "thinking_delta", "value": str}   (streamed THINK fragment chunk)
 - {"type": "thinking_done", "value": True}   (THINK fragment finished)
+- {"type": "response_delta", "value": str, "tool": str}
+    (streamed user_response/ask_user text while the JSON is still arriving)
 """
 import json
 import re
 from typing import Any, Dict, Generator, Iterable
+
+
+# Tools whose text payload (description/question) is streamed to the UI
+# while the JSON response is still arriving.
+_RESPONSE_TOOL_FIELDS = (
+    (re.compile(r'"tool"\s*:\s*"user_response"'), "user_response", "description"),
+    (re.compile(r'"tool"\s*:\s*"ask_user"'), "ask_user", "question"),
+)
+
+_STRING_ESCAPES = {
+    '"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t",
+    "r": "\r", "b": "\b", "f": "\f",
+}
+
+
+def _extract_partial_string_field(content: str, field: str):
+    """Extract the (possibly incomplete) value of ``"<field>": "..."`` from
+    progressively accumulated JSON text.
+
+    Returns None while the field has not started. Once the opening quote is
+    seen, returns the decoded text so far; it stays partial until the closing
+    quote arrives. Escape sequences are decoded; a trailing incomplete escape
+    is excluded so no character is ever emitted twice.
+    """
+    m = re.search(r'"' + re.escape(field) + r'"\s*:\s*"', content)
+    if not m:
+        return None
+    i = m.end()
+    out = []
+    n = len(content)
+    while i < n:
+        ch = content[i]
+        if ch == '"':
+            break  # closing quote: value complete
+        if ch == "\\":
+            if i + 1 >= n:
+                break  # trailing backslash: incomplete escape
+            esc = content[i + 1]
+            if esc == "u":
+                hexdigits = content[i + 2:i + 6]
+                if len(hexdigits) < 4:
+                    break  # incomplete \uXXXX escape
+                try:
+                    cp = int(hexdigits, 16)
+                except ValueError:
+                    break
+                if 0xD800 <= cp <= 0xDBFF:
+                    # High surrogate: wait for the low surrogate to arrive
+                    if content[i + 6:i + 8] != "\\u":
+                        break
+                    low_hex = content[i + 8:i + 12]
+                    if len(low_hex) < 4:
+                        break
+                    try:
+                        low = int(low_hex, 16)
+                    except ValueError:
+                        break
+                    if not (0xDC00 <= low <= 0xDFFF):
+                        break
+                    combined = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                    out.append(chr(combined))
+                    i += 12
+                    continue
+                out.append(chr(cp))
+                i += 6
+                continue
+            if esc in _STRING_ESCAPES:
+                out.append(_STRING_ESCAPES[esc])
+                i += 2
+                continue
+            # Unknown escape: pass the escaped char through
+            out.append(esc)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _stream_response_deltas(content: str, state: dict):
+    """Detect a user_response/ask_user action in the accumulating JSON and
+    progressively yield its text payload (description/question) as
+    ``response_delta`` events until the JSON string ends.
+
+    ``state`` tracks detection and emission progress across calls:
+    {"tool": str|None, "field": str|None, "emitted": int}
+    """
+    if state.get("tool") is None:
+        for regex, tool_name, field in _RESPONSE_TOOL_FIELDS:
+            if regex.search(content):
+                state["tool"] = tool_name
+                state["field"] = field
+                break
+        else:
+            return
+    partial = _extract_partial_string_field(content, state["field"])
+    if partial is None:
+        return
+    emitted = state.get("emitted", 0)
+    if len(partial) > emitted:
+        yield {
+            "type": "response_delta",
+            "value": partial[emitted:],
+            "tool": state["tool"],
+        }
+        state["emitted"] = len(partial)
 
 
 def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
@@ -39,6 +147,8 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
     content = ""
     last_fragment_type = None   # "THINK" | "RESPONSE" | None
     thinking_active = False
+    # Streaming state for user_response/ask_user text payloads
+    stream_state = {"tool": None, "field": None, "emitted": 0}
 
     for line in lines:
         if not line or not line.startswith("data: "):
@@ -49,8 +159,14 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
         except json.JSONDecodeError:
             continue
 
-        if obj.get("type")=="error":
-            yield obj
+        if obj.get("type") == "error":
+            err_value = (
+                obj.get("content")
+                or obj.get("v")
+                or obj.get("error")
+                or "Unknown API error"
+            )
+            yield {"type": "error", "value": err_value}
             return
         # ------------------------------------------------------
         # Initial response: detect protocol and get message_id
@@ -82,6 +198,8 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                     if last_fragment_type == "RESPONSE":
                         collecting = True
                         content = last.get("content", "")
+                        if content:
+                            yield from _stream_response_deltas(content, stream_state)
                     elif last_fragment_type == "THINK":
                         thinking_active = True
                         initial = last.get("content", "")
@@ -116,6 +234,8 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                     if new_type == "RESPONSE":
                         collecting = True
                         content = new_last.get("content", "")
+                        if content:
+                            yield from _stream_response_deltas(content, stream_state)
                         if prev_type == "THINK" and thinking_active:
                             thinking_active = False
                             yield {"type": "thinking_done", "value": True}
@@ -133,11 +253,13 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                             yield {"type": "thinking_delta", "value": value}
                     elif collecting and isinstance(value, str):
                         content += value
+                        yield from _stream_response_deltas(content, stream_state)
                 elif path is None and isinstance(value, str):
                     if thinking_active:
                         yield {"type": "thinking_delta", "value": value}
                     elif collecting:
                         content += value
+                        yield from _stream_response_deltas(content, stream_state)
                 # Other paths (elapsed_secs, BATCH, etc.) are ignored
 
         # ------------------------------------------------------
@@ -158,6 +280,7 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
             if not isinstance(value, str):
                 continue
             content += value
+            yield from _stream_response_deltas(content, stream_state)
 
     # ----------------------------------------------------------
     # Parse the accumulated content
@@ -178,10 +301,13 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Fallback: extract the first complete JSON object
+        # Fallback: extract the best complete JSON object from the text
         data = _extract_json_object(text)
         if data is None:
             return
+
+    if not isinstance(data, dict):
+        return
 
     # Yield status
     status = data.get("status")
@@ -196,34 +322,55 @@ def parse_sse(lines: Iterable[str]) -> Generator[Dict[str, Any], None, None]:
                 yield {"type": "action", "value": action}
 
 
-def _extract_json_object(text: str) -> dict | None:
-    """Extract the first complete JSON object from text using brace counting."""
+def _iter_json_objects(text: str):
+    """Yield every complete top-level JSON object found in text (brace counting)."""
     start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if esc:
-            esc = False
-            continue
-        if ch == "\\" and in_str:
-            esc = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError:
-                    return None
-    return None
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\" and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            break
+        try:
+            obj = json.loads(text[start:end + 1])
+            if isinstance(obj, dict):
+                yield obj
+        except json.JSONDecodeError:
+            pass
+        start = text.find("{", end + 1)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the most relevant JSON state object from text.
+
+    Prefers objects containing the agent protocol keys ('status'/'actions');
+    falls back to the first complete object found.
+    """
+    first = None
+    for obj in _iter_json_objects(text):
+        if "status" in obj or "actions" in obj:
+            return obj
+        if first is None:
+            first = obj
+    return first

@@ -17,9 +17,8 @@ from .agent_wrapper import AgentWrapper
 from .widgets.tool_writer import format_tool_done
 from .widgets.tool_entry import ToolCallEntry
 from app.theme import (
-    BG_MAIN, BG_INPUT, TEXT_PRIMARY, TEXT_SECONDARY,
-    BORDER_LIGHT, BORDER_MEDIUM, ACCENT_RGB,
-    load_theme, list_presets, get_theme,
+    ACCENT_RGB,
+    load_theme, list_presets, get_theme, build_textual_theme,
 )
 
 class MainApp(App):
@@ -27,75 +26,83 @@ class MainApp(App):
         ("ctrl+t", "toggle_thinking", "Toggle thinking mode"),
     ]
 
-    CSS = f"""
-    App {{
-        background: {BG_MAIN};
-    }}
-    #main_container {{
+    # All colors are resolved from CSS variables provided by the active
+    # Textual theme (see app.theme.build_textual_theme), so switching the
+    # theme at runtime restyles the whole UI.
+    CSS = """
+    App {
+        background: $background;
+    }
+    #main_container {
         layout: grid;
         grid-size: 1;
         grid-rows: 1fr 1 auto 1;
         height: 100%;
-        background: {BG_MAIN};
-    }}
-    #scrollable_area {{
+        background: $background;
+    }
+    #scrollable_area {
         height: 1fr;
-        border: solid {BORDER_LIGHT};
-        background: {BG_MAIN};
+        border: solid $border-light;
+        background: $background;
         overflow-y: auto;
-    }}
-    #status {{
+    }
+    #status {
         height: 1;
-        background: {BG_MAIN};
-        color: {TEXT_SECONDARY};
-    }}
-    #input_area {{
+        background: $background;
+        color: $text-secondary;
+    }
+    #input_area {
         layout: vertical;
         height: auto;
         min-height: 3;
-        border: solid {BORDER_LIGHT};
+        border: solid $border-light;
         padding: 0;
-        background: {BG_MAIN};
-    }}
-    #suggestions {{
-        background: {BG_MAIN};
-    }}
-    #permission_selector {{
+        background: $background;
+    }
+    #suggestions {
+        background: $background;
+    }
+    #permission_selector {
         display: none;
         height: 6;
-        background: {BG_MAIN};
-        border: solid {BORDER_MEDIUM};
-    }}
-    #permission_selector.visible {{
+        background: $background;
+        border: solid $border-medium;
+    }
+    #permission_selector.visible {
         display: block;
-    }}
-    #input_box {{
+    }
+    #input_box {
         height: 3;
         padding: 0 1;
-        color: {TEXT_PRIMARY};
-        background: {BG_INPUT};
-    }}
-    #input_box .input {{
-        color: {TEXT_PRIMARY};
-        background: {BG_INPUT};
-    }}
-    #input_box .placeholder {{
-        color: {TEXT_SECONDARY};
-    }}
-    #logo {{ align-horizontal: center; margin-bottom: 1; }}
-    #conversation {{
+        color: $foreground;
+        background: $panel;
+    }
+    #input_box .input {
+        color: $foreground;
+        background: $panel;
+    }
+    #input_box .placeholder {
+        color: $text-secondary;
+    }
+    #logo { align-horizontal: center; margin-bottom: 1; }
+    #conversation {
         height: auto;
         overflow-y: hidden;
-    }}
-    #footer {{
+    }
+    #footer {
         height: 1;
-        background: {BG_MAIN};
-        color: {TEXT_SECONDARY};
-    }}
+        background: $background;
+        color: $text-secondary;
+    }
     """
 
     def __init__(self):
         super().__init__()
+        # Load the palette config and register the derived Textual theme
+        # BEFORE the startup stylesheet parse, so custom CSS variables
+        # ($border-light, $text-secondary, ...) are defined at parse time.
+        load_theme()
+        self._apply_textual_theme()
         self.state = AppState()
         self.suggestions = SuggestionsList(id="suggestions")
         self.suggestions.hide()
@@ -110,6 +117,9 @@ class MainApp(App):
         self._tool_entries = {}
         # Buffer for streaming thinking text into the status bar line by line
         self._thinking_buffer = ""
+        # Live streaming of user_response/ask_user text while the JSON arrives
+        self._response_stream_entry = None
+        self._response_stream_buffer = ""
         
 
     def compose(self) -> ComposeResult:
@@ -132,9 +142,29 @@ class MainApp(App):
         conversation.write(f"Thinking mode toggled to: {new_mode}")
         self.query_one("#footer").refresh()
 
+    def _apply_textual_theme(self) -> None:
+        """Register and activate the Textual theme built from the palette.
+
+        Setting ``App.theme`` reparses the stylesheet with the new CSS
+        variables and restyles every widget live. The stylesheet variables
+        are also synced immediately so that a startup CSS parse (which runs
+        before reactive watchers fire) already sees the custom variables.
+        """
+        theme = build_textual_theme()
+        self.register_theme(theme)
+        self.theme = theme.name
+        try:
+            self.stylesheet.set_variables(self.get_css_variables())
+        except Exception:
+            # Stylesheet may not exist in edge cases; the reactive watcher
+            # will sync variables on the next theme change.
+            pass
+
     def on_mount(self) -> None:
-        # Load theme (attempt config file or default)
+        # Re-apply the theme in case the config theme differs from the
+        # one registered during __init__ (idempotent when unchanged).
         load_theme()
+        self._apply_textual_theme()
         # Set workspace to actual current path
         self.state.set_workspace(os.getcwd())
         self.state.set_model("DeepSeek-V3")
@@ -152,6 +182,7 @@ class MainApp(App):
             'on_tool_result': self._on_agent_tool_result,
             'on_thinking': self._on_agent_thinking,
             'on_thinking_done': self._on_agent_thinking_done,
+            'on_response_delta': self._on_agent_response_delta,
             'on_status': self._on_agent_status,
             'on_question': self._on_agent_question,
             'on_finish': self._on_agent_finish,
@@ -248,15 +279,25 @@ class MainApp(App):
                 return cmd.requires_arguments
         return False
 
+    def _set_terminal_title(self, status_text: str) -> None:
+        """Update the terminal window title (best effort, never raises)."""
+        try:
+            stdout = sys.__stdout__
+            if stdout is None or not hasattr(stdout, "buffer"):
+                return
+            stdout.buffer.write(f"\x1b]0;DeepSeekCli - {status_text}\x07".encode())
+            stdout.buffer.flush()
+        except Exception:
+            pass
+
     def set_status_with_input(self, status_text: str) -> None:
         """Set status bar text and enable/disable input box accordingly."""
         status = self.query_one("#status")
         input_box = self.query_one("#input_box")
-        
+
         status.set_status(status_text)
         # Update terminal window title
-        sys.__stdout__.buffer.write(f"\x1b]0;DeepSeekCli - {status_text}\x07".encode())
-        sys.__stdout__.buffer.flush()
+        self._set_terminal_title(status_text)
         # Disable input when not Ready, enable when Ready
         input_box.disabled = (status_text != "Ready")
         if status_text=="Ready":
@@ -286,6 +327,7 @@ class MainApp(App):
         cmd = parts[0]
 
         if cmd == "clear":
+            self._finalize_response_stream()
             conversation.clear()
             self.set_status_with_input("Ready")
         elif cmd == "help":
@@ -326,7 +368,11 @@ class MainApp(App):
             else:
                 theme_name = parts[1].lower()
                 if load_theme(theme_name):
+                    self._apply_textual_theme()
                     conversation.write(f"Theme changed to: [bold]{theme_name}[/bold]")
+                    # Refresh Rich-rendered widgets that read palette globals
+                    self.query_one("#logo").refresh()
+                    self.query_one("#footer").refresh()
                     self.refresh()
                 else:
                     conversation.write(f"Theme '{theme_name}' not found. Available: {', '.join(list_presets())}")
@@ -396,8 +442,38 @@ class MainApp(App):
         self.query_one("#input_box").focus()
 
     # Callback methods for agent
+
+    def _finalize_response_stream(self) -> None:
+        """Remove the live streaming entry (if any) before the final message
+        is written by the normal message handlers."""
+        entry = self._response_stream_entry
+        self._response_stream_entry = None
+        self._response_stream_buffer = ""
+        if entry is not None:
+            try:
+                entry.remove()
+            except Exception:
+                pass
+
+    def _on_agent_response_delta(self, delta: str) -> None:
+        """Stream user_response/ask_user text into the conversation while the
+        JSON is still arriving from the SSE stream."""
+        if not delta:
+            return
+        from textual.widgets import Static
+        if self._response_stream_entry is None:
+            conversation = self.query_one("#conversation")
+            entry = Static("", classes="assistant-message streaming-message")
+            self._response_stream_entry = entry
+            conversation.mount(entry)
+        self._response_stream_buffer += delta
+        # Plain Text renderable: streamed text is not interpreted as markup
+        self._response_stream_entry.update(Text(self._response_stream_buffer))
+        self.call_after_refresh(self._scroll_to_bottom)
+
     def _on_agent_message(self, message: str) -> None:
         """Called when agent sends a message."""
+        self._finalize_response_stream()
         conversation = self.query_one("#conversation")
         conversation.write(f"\u2726 {message}")
         self.call_after_refresh(self._scroll_to_bottom)
@@ -486,13 +562,11 @@ class MainApp(App):
             if not self.timer_active:
                 status_bar.start_elapsed_timer("Thinking...")
                 self.timer_active = True
-            sys.__stdout__.buffer.write(b"\x1b]0;DeepSeekCli - Thinking...\x07")
-            sys.__stdout__.buffer.flush()
+            self._set_terminal_title("Thinking...")
         elif status == 'waiting':
             status_bar.set_status("Ready")
             self.timer_active = False
-            sys.__stdout__.buffer.write(b"\x1b]0;DeepSeekCli - Ready\x07")
-            sys.__stdout__.buffer.flush()
+            self._set_terminal_title("Ready")
             input_box = self.query_one("#input_box")
             input_box.disabled = False
             input_box.focus()
@@ -502,11 +576,11 @@ class MainApp(App):
             self.set_status_with_input("Ready")
         else:
             status_bar.set_status(status)
-            sys.__stdout__.buffer.write(f"\x1b]0;DeepSeekCli - {status}\x07".encode())
-            sys.__stdout__.buffer.flush()
+            self._set_terminal_title(status)
 
     def _on_agent_question(self, question: str) -> None:
         """Called when agent asks a question."""
+        self._finalize_response_stream()
         conversation = self.query_one("#conversation")
         styled = Text("\u2726 Agent asks: ", style=ACCENT_RGB)
         styled.append(question, style="bold white")
@@ -522,6 +596,7 @@ class MainApp(App):
 
     def _on_agent_finish(self, message: str) -> None:
         """Called when agent finishes."""
+        self._finalize_response_stream()
         if message:
             conversation = self.query_one("#conversation")
             styled = Text("Agent finished: ", style=ACCENT_RGB)

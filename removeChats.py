@@ -5,11 +5,15 @@ Usage:
 
 If KEEP_CHAT_ID is provided, that session is preserved.
 Otherwise, ALL sessions are deleted.
+
+Sessions are fetched through DeepSeekClient.fetch_chats(), which follows
+pagination, so all sessions (not just the first page) are processed.
 """
 import sys
 import requests
 
 from app.agent.config import Config
+from app.agent.module import create_client
 
 
 def main():
@@ -19,19 +23,9 @@ def main():
     Config.load()
     cookies = Config.get_cookies()
     headers = Config.get_headers()
+    client = create_client()
 
-    params = {
-        'lte_cursor.pinned': 'false',
-    }
-
-    response = requests.get(
-        'https://chat.deepseek.com/api/v0/chat_session/fetch_page',
-        params=params,
-        cookies=cookies,
-        headers=headers,
-    )
-
-    chats = response.json()['data']['biz_data']['chat_sessions']
+    chats = client.fetch_chats()
     deleted = 0
     skipped = 0
 

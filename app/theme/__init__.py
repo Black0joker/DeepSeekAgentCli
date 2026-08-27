@@ -200,11 +200,12 @@ def load_theme(theme_name: Optional[str] = None, config_path: Optional[str] = No
     """Load a theme from presets or a JSON config file.
 
     Order of precedence:
-    1. JSON config file at config_path or config/theme.json
-    2. Built-in preset by theme_name
+    1. Explicit theme_name matching a built-in preset (when provided)
+    2. JSON config file at config_path or config/theme.json
     3. Default theme
 
-    Returns True if loaded successfully.
+    Returns True if a theme was loaded. Returns False when theme_name is
+    provided but does not match any built-in preset.
     """
     global _current_theme_name, _custom_overrides
     global ACCENT, ACCENT_RGB, BG_MAIN, BG_WIDGET, BG_INPUT
@@ -215,27 +216,31 @@ def load_theme(theme_name: Optional[str] = None, config_path: Optional[str] = No
 
     overrides = {}
 
-    # Try config file first
-    if config_path:
-        path = Path(config_path)
-    else:
-        path = _get_config_dir() / "theme.json"
-
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                overrides = json.load(f)
-            _current_theme_name = overrides.pop("_name", path.stem)
-        except (json.JSONDecodeError, OSError) as e:
-            Logger.warn(f"Failed to load theme config from {path}: {e}")
-
-    # Try preset if no file overrides
-    if not overrides and theme_name and theme_name in PRESETS:
-        overrides = PRESETS[theme_name]
+    if theme_name is not None:
+        # An explicit preset was requested; it must exist.
+        if theme_name not in PRESETS:
+            return False
+        overrides = dict(PRESETS[theme_name])
         _current_theme_name = theme_name
-    elif not overrides:
-        _current_theme_name = "default"
-        overrides = {}
+    else:
+        # No explicit theme requested: try the config file, then defaults.
+        if config_path:
+            path = Path(config_path)
+        else:
+            path = _get_config_dir() / "theme.json"
+
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    overrides = json.load(f)
+                _current_theme_name = overrides.pop("_name", path.stem)
+            except (json.JSONDecodeError, OSError) as e:
+                Logger.warn(f"Failed to load theme config from {path}: {e}")
+                overrides = {}
+
+        if not overrides:
+            _current_theme_name = "default"
+            overrides = {}
 
     # Apply overrides (only update globals for keys that exist in defaults)
     _custom_overrides = overrides
@@ -267,3 +272,35 @@ def _apply_override(key: str, overrides: dict) -> None:
     import sys
     if key in overrides:
         setattr(sys.modules[__name__], key, overrides[key])
+
+
+def build_textual_theme():
+    """Build a ``textual.theme.Theme`` from the current palette.
+
+    The Textual theme drives all CSS variables (``$background``, ``$panel``,
+    ``$foreground``, ``$accent``, ``$border-light``, ...). Registering it
+    with the App and setting ``App.theme`` to its name reparses the
+    stylesheet and restyles the entire UI live.
+    """
+    from textual.theme import Theme
+
+    return Theme(
+        name=f"warriorx-{_current_theme_name}",
+        primary=ACCENT,
+        secondary=TEXT_SECONDARY,
+        warning=WARNING,
+        error=ERROR,
+        success=SUCCESS,
+        accent=ACCENT,
+        foreground=TEXT_PRIMARY,
+        background=BG_MAIN,
+        surface=BG_WIDGET,
+        panel=BG_INPUT,
+        dark=True,
+        variables={
+            "text-secondary": TEXT_SECONDARY,
+            "text-muted": TEXT_MUTED,
+            "border-light": BORDER_LIGHT,
+            "border-medium": BORDER_MEDIUM,
+        },
+    )

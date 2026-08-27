@@ -3,7 +3,6 @@ from textual.containers import Horizontal
 from textual.message import Message
 
 from app.command_defs import Command
-from app.theme import ACCENT, TEXT_PRIMARY, TEXT_SECONDARY, BORDER_MEDIUM, BG_MAIN
 
 class CommandListItem(ListItem):
     """Custom ListItem for displaying a command with name and description."""
@@ -17,43 +16,44 @@ class CommandListItem(ListItem):
         super().__init__(container)
 
 class SuggestionsList(ListView):
-    DEFAULT_CSS = f"""
-    SuggestionsList {{
+    # Colors come from CSS variables provided by the active Textual theme.
+    DEFAULT_CSS = """
+    SuggestionsList {
         display: none;
         overflow-y: auto;
-        background: {BG_MAIN};
-        border: solid {BORDER_MEDIUM};
-    }}
-    SuggestionsList.visible {{
+        background: $background;
+        border: solid $border-medium;
+    }
+    SuggestionsList.visible {
         display: block;
-    }}
-    SuggestionsList ListItem {{
+    }
+    SuggestionsList ListItem {
         height: 1;
         padding: 0;
-    }}
-    SuggestionsList ListItem > Widget {{
+    }
+    SuggestionsList ListItem > Widget {
         height: 1;
-    }}
-    .command-row {{
+    }
+    .command-row {
         height: 1;
         padding: 0 1;
-    }}
-    .command-name {{
-        color: {ACCENT};
+    }
+    .command-name {
+        color: $accent;
         width: 15;
-    }}
-    .command-desc {{
-        color: {TEXT_SECONDARY};
-    }}
-    .highlight .command-name {{
-        color: {TEXT_PRIMARY};
-    }}
-    .highlight .command-desc {{
-        color: {TEXT_PRIMARY};
-    }}
-    .highlight {{
+    }
+    .command-desc {
+        color: $text-secondary;
+    }
+    .highlight .command-name {
+        color: $foreground;
+    }
+    .highlight .command-desc {
+        color: $foreground;
+    }
+    .highlight {
         background: $accent;
-    }}
+    }
     """
 
     class Selected(Message):

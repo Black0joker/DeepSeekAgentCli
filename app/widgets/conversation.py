@@ -4,37 +4,38 @@ from rich.text import Text
 from rich.markdown import Markdown
 from typing import Union
 from app.theme import (
-    BG_MAIN, BG_INPUT, TEXT_PRIMARY, TEXT_PRIMARY_RGB,
+    TEXT_PRIMARY_RGB,
     TEXT_MUTED_RGB, ACCENT, ACCENT_RGB,
 )
 
 class ConversationView(Container):
     """Conversation area that displays messages. It is meant to be placed inside a scrollable container."""
-    DEFAULT_CSS = f"""
-    .user-message {{
+    # Colors come from CSS variables provided by the active Textual theme.
+    DEFAULT_CSS = """
+    .user-message {
         height: auto;
-        background: {BG_INPUT};
+        background: $panel;
         padding: 1 1;
         margin: 2 0;
-        color: {TEXT_PRIMARY};
-    }}
-    .user-message Static {{
-        color: {TEXT_PRIMARY};
-    }}
-    .user-message .command-message {{
-        color: {ACCENT};
-    }}
-    .assistant-message {{
+        color: $foreground;
+    }
+    .user-message Static {
+        color: $foreground;
+    }
+    .user-message .command-message {
+        color: $accent;
+    }
+    .assistant-message {
         height: auto;
         margin: 1 0;
-        color: {TEXT_PRIMARY};
-        background: {BG_MAIN};
+        color: $foreground;
+        background: $background;
         text-style: bold;
-    }}
-    .system-message {{
+    }
+    .system-message {
         margin: 1 0;
-        background: {BG_MAIN};
-    }}
+        background: $background;
+    }
     """
 
     def __init__(self, *args, **kwargs):

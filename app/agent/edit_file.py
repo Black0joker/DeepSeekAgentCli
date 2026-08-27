@@ -1412,6 +1412,12 @@ def edit_file(
             suggested_action="provide_replace_text",
         )
 
+    # Normalize replacement line endings to LF before splicing into the
+    # LF-normalized content. The original line ending style is restored for
+    # the whole file after the edit; without this normalization a
+    # replacement containing CRLF would be corrupted into CR-CRLF.
+    replace = _normalize_to_lf(replace)
+
 
 
 

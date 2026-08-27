@@ -1,6 +1,15 @@
 """
 Test script for the SSE parser.
-Reads logs/completion.log and feeds the SSE lines through the parser.
+
+Reads an SSE log (default: logs/completion.log, falling back to
+sse_response.log in the project root) and feeds the lines through the parser.
+
+Usage:
+    python test_sse_parser.py [path/to/sse.log]
+
+Strict validation (specific message_id / actions) only runs against the
+canonical logs/completion.log fixture. Any other log is treated as a smoke
+test: the parser must consume it without raising and yield well-formed events.
 """
 import sys
 import os
@@ -12,7 +21,7 @@ from app.agent.sse_parser import parse_sse
 
 
 def read_sse_lines_from_log(log_path: str) -> list[str]:
-    """Extract raw SSE lines from the completion log file.
+    """Extract raw SSE lines from a log file.
     The log contains raw SSE data lines (starting with 'data: ' or 'event: ').
     """
     lines = []
@@ -28,42 +37,23 @@ def read_sse_lines_from_log(log_path: str) -> list[str]:
     return lines
 
 
-def main():
-    log_path = os.path.join('logs', 'completion.log')
-    if not os.path.exists(log_path):
-        print(f'ERROR: {log_path} not found')
-        sys.exit(1)
+def resolve_log_path() -> str | None:
+    """Determine which log file to parse."""
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    for candidate in (os.path.join('logs', 'completion.log'), 'sse_response.log'):
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
-    print(f'Reading SSE lines from: {log_path}')
-    lines = read_sse_lines_from_log(log_path)
-    print(f'Total lines: {len(lines)}')
-    print(f'Data lines: {sum(1 for l in lines if l.startswith("data: "))}')
-    print()
 
-    # Feed lines through the parser
-    print('--- Parser Output ---')
-    events = list(parse_sse(lines))
+def run_strict_validation(events: list[dict]) -> bool:
+    """Validate parser output against the canonical completion.log fixture."""
+    passed = True
 
-    for event in events:
-        if event['type'] == 'message_id':
-            print(f'[MESSAGE_ID] {event["value"]}')
-        elif event['type'] == 'status':
-            print(f'[STATUS] {event["value"]}')
-        elif event['type'] == 'action':
-            action = event['value']
-            print(f'[ACTION] id={action.get("id")} tool={action.get("tool")} args={action.get("arguments")}')
-
-    print()
-    print(f'Total events yielded: {len(events)}')
-
-    # Validate expected results
     message_ids = [e for e in events if e['type'] == 'message_id']
     statuses = [e for e in events if e['type'] == 'status']
     actions = [e for e in events if e['type'] == 'action']
-
-    print()
-    print('--- Validation ---')
-    passed = True
 
     # Check message_id
     if len(message_ids) == 1 and message_ids[0]['value'] == 4:
@@ -108,6 +98,56 @@ def main():
         else:
             print(f'FAIL: action 2 unexpected: {a2}')
             passed = False
+
+    return passed
+
+
+def main():
+    log_path = resolve_log_path()
+    if log_path is None:
+        print('ERROR: no SSE log found (looked for logs/completion.log and sse_response.log)')
+        sys.exit(1)
+
+    print(f'Reading SSE lines from: {log_path}')
+    lines = read_sse_lines_from_log(log_path)
+    print(f'Total lines: {len(lines)}')
+    print(f'Data lines: {sum(1 for l in lines if l.startswith("data: "))}')
+    print()
+
+    # Feed lines through the parser
+    print('--- Parser Output ---')
+    events = list(parse_sse(lines))
+
+    for event in events:
+        if event['type'] == 'message_id':
+            print(f'[MESSAGE_ID] {event["value"]}')
+        elif event['type'] == 'status':
+            print(f'[STATUS] {event["value"]}')
+        elif event['type'] == 'action':
+            action = event['value']
+            print(f'[ACTION] id={action.get("id")} tool={action.get("tool")} args={action.get("arguments")}')
+        elif event['type'] == 'error':
+            print(f'[ERROR] {event["value"]}')
+        else:
+            print(f'[{event["type"]}] {event.get("value", "")!r}')
+
+    print()
+    print(f'Total events yielded: {len(events)}')
+
+    print()
+    print('--- Validation ---')
+
+    canonical_fixture = os.path.normpath(log_path) == os.path.normpath(os.path.join('logs', 'completion.log'))
+    if canonical_fixture:
+        passed = run_strict_validation(events)
+    else:
+        # Smoke test: parser ran without exception and events are well-formed
+        well_formed = all(isinstance(e, dict) and 'type' in e and 'value' in e for e in events)
+        if well_formed:
+            print(f'PASS: smoke test - {len(events)} well-formed events parsed from {log_path}')
+        else:
+            print(f'FAIL: smoke test - malformed events found in output')
+        passed = well_formed
 
     print()
     if passed:
