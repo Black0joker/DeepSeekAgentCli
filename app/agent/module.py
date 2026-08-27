@@ -1428,7 +1428,7 @@ class DeepSeekClient:
         json_data = {
             'chat_session_id': chat_session_id,
             'parent_message_id': parent_message_id,
-            'model_type': 'expert',
+            'model_type': 'default',
             'prompt': prompt,
             'ref_file_ids': [],
             'thinking_enabled': thinking_mode,
